@@ -30,6 +30,7 @@ import os
 import sys
 import json
 import glob as glob_module
+import socket
 import subprocess
 import datetime
 import readline
@@ -40,12 +41,17 @@ import threading
 import itertools
 import time
 import signal
+import shutil
 import importlib.util
 from pathlib import Path
 from typing import Optional
 
-# Ignore Ctrl+Z (SIGTSTP) — prevent suspending the process
-signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+# Ignore Ctrl+Z (SIGTSTP) — Unix only; SIGTSTP doesn't exist on Windows
+if hasattr(signal, "SIGTSTP"):
+    signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+
+# Detect available shell — prefer bash, fall back to system default
+_BASH_PATH = shutil.which("bash") or "/bin/sh"
 
 from policy import PolicyEngine, PolicyDecision
 from compactor import compact_messages, estimate_tokens, should_compact
@@ -407,7 +413,7 @@ def execute_tool(name: str, args: dict) -> str:
             result  = subprocess.run(
                 cmd, shell=True, capture_output=True,
                 text=True, timeout=timeout,
-                executable="/bin/bash"
+                executable=_BASH_PATH
             )
             out = result.stdout.strip()
             err = result.stderr.strip()
@@ -421,7 +427,7 @@ def execute_tool(name: str, args: dict) -> str:
             limit  = args.get("limit", 200)
             if not path.exists():
                 return f"File not found: {path}"
-            lines = path.read_text(errors="replace").splitlines()
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             total = len(lines)
             selected = lines[offset:offset + limit]
             numbered = [f"{i+offset+1}\t{line}" for i, line in enumerate(selected)]
@@ -436,7 +442,7 @@ def execute_tool(name: str, args: dict) -> str:
             append  = args.get("append", False)
             path.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if append else "w"
-            with path.open(mode) as f:
+            with path.open(mode, encoding="utf-8") as f:
                 f.write(content)
             return f"OK — wrote {len(content)} chars to {path}"
 
@@ -446,14 +452,14 @@ def execute_tool(name: str, args: dict) -> str:
             new_string = args["new_string"]
             if not path.exists():
                 return f"File not found: {path}"
-            text = path.read_text(errors="replace")
+            text = path.read_text(encoding="utf-8", errors="replace")
             count = text.count(old_string)
             if count == 0:
                 return f"old_string not found in {path}"
             if count > 1:
                 return f"old_string found {count}x — must be unique. Provide more context."
             new_text = text.replace(old_string, new_string, 1)
-            path.write_text(new_text)
+            path.write_text(new_text, encoding="utf-8")
             return f"OK — edited {path} (replaced 1 occurrence)"
 
         elif name == "grep_search":
@@ -470,6 +476,9 @@ def execute_tool(name: str, args: dict) -> str:
             result = subprocess.run(
                 cmd_parts, capture_output=True, text=True, timeout=15
             )
+            # grep exit codes: 0 = match found, 1 = no match, >=2 = error
+            if result.returncode >= 2:
+                return f"grep error: {result.stderr.strip() or 'unknown error'}"
             lines = result.stdout.strip().splitlines()
             if len(lines) > max_results:
                 lines = lines[:max_results]
@@ -492,6 +501,8 @@ def execute_tool(name: str, args: dict) -> str:
             path = Path(args["path"])
             if not path.exists():
                 return f"Directory not found: {path}"
+            if not path.is_dir():
+                return f"Not a directory: {path} (use read_file for files)"
             items = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
             lines = []
             for item in items:
@@ -899,7 +910,7 @@ def get_briefing() -> str:
 # ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 def build_system_prompt(briefing: str, plugin_info: str = "") -> str:
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    hostname = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    hostname = socket.gethostname()
     cs_info = f"Consciousness Server: {CS_URL}" if CS_URL else ""
     return f"""You are Cortex — a local AI agent with system access.
 
@@ -1071,12 +1082,15 @@ def main():
 
     session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # build system prompt — use plugin prompt if active, otherwise default
-    if ACTIVE_PLUGIN and plugin_prompt_extra:
-        sys_prompt = plugin_prompt_extra
-    else:
-        sys_prompt = build_system_prompt(briefing, plugin_prompt_extra)
+    # Helper to build the full system prompt.
+    # Plugin prompts EXTEND the base prompt — they cannot replace the safety rules.
+    def _full_prompt(b: str = "") -> str:
+        base = build_system_prompt(b, "")
+        if ACTIVE_PLUGIN and plugin_prompt_extra:
+            return f"{base}\n\n# Plugin: {ACTIVE_PLUGIN}\n{plugin_prompt_extra}"
+        return base
 
+    sys_prompt = _full_prompt(briefing)
     messages = [{"role": "system", "content": sys_prompt}]
 
     # readline history + tab completion
@@ -1139,8 +1153,10 @@ def main():
         try:
             pick = int(choice)
             if 1 <= pick <= len(shown):
+                # Truncate AFTER the selected user message (keep that message,
+                # drop everything after it — including its assistant reply)
                 target_msg_idx = shown[pick - 1][0]
-                messages[:] = messages[:target_msg_idx]
+                messages[:] = messages[:target_msg_idx + 1]
                 print(f"  {C.GREEN}+{C.RESET} Rewound. Continue from this point.")
             else:
                 print(f"  {C.RED}Invalid number{C.RESET}")
@@ -1236,7 +1252,7 @@ def main():
                 THINK_MODE = not THINK_MODE
                 state = f"{C.GREEN}ON{C.RESET}" if THINK_MODE else f"{C.RED}OFF{C.RESET}"
                 print(f"  Thinking mode: {state}")
-                messages[0]["content"] = build_system_prompt(briefing)
+                messages[0]["content"] = _full_prompt(briefing)
                 continue
 
             elif user_input == "/briefing":
@@ -1245,7 +1261,7 @@ def main():
                 continue
 
             elif user_input == "/clear":
-                messages = [{"role": "system", "content": build_system_prompt(briefing)}]
+                messages = [{"role": "system", "content": _full_prompt(briefing)}]
                 recovery.reset()
                 print(f"  {C.GREEN}+{C.RESET} History cleared")
                 continue
