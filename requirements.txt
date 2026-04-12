@@ -1,0 +1,6 @@
+# Cortex — dependencies
+requests>=2.31.0
+fastapi>=0.110.0
+uvicorn>=0.27.0
+websockets>=12.0
+# anthropic>=0.25.0    # optional: uncomment for Anthropic API fallback

@@ -1,0 +1,1480 @@
+#!/usr/bin/env python3
+"""
+Cortex — Web UI
+FastAPI + WebSocket + single-file HTML interface
+Uruchom: python web.py
+Otwórz:  http://localhost:8080
+"""
+
+import os
+import json
+import datetime
+import requests
+import subprocess
+import asyncio
+from pathlib import Path
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+import uvicorn
+
+# ─── CONFIG (shared z agent.py) ────────────────────────────────────────────────
+OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:26b")
+CS_URL       = os.getenv("CS_URL",       "")
+AGENT_NAME   = os.getenv("AGENT_NAME",   "cortex")
+THINK_MODE   = os.getenv("THINK_MODE",   "false").lower() == "true"
+WEB_PORT     = int(os.getenv("WEB_PORT", "8080"))
+
+app = FastAPI(title="Cortex")
+
+# ─── SESSION STORAGE ──────────────────────────────────────────────────────────
+SESSIONS_DIR = Path.home() / ".cortex" / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _save_session_local(session_id: str, messages: list, meta: dict = None):
+    """Zapisz sesję do lokalnego pliku JSON."""
+    data = {
+        "id": session_id,
+        "messages": [m for m in messages if m.get("role") != "system"],
+        "model": OLLAMA_MODEL,
+        "updated_at": datetime.datetime.now().isoformat(),
+        "meta": meta or {}
+    }
+    # tytuł z pierwszej wiadomości usera
+    for m in messages:
+        if m.get("role") == "user":
+            data["title"] = m["content"][:80]
+            break
+    path = SESSIONS_DIR / f"{session_id}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+import re as _re
+_SAFE_SESSION_ID = _re.compile(r"^[A-Za-z0-9_\-]+$")
+
+def _load_session_local(session_id: str) -> dict:
+    """Load session from file (validates session_id to prevent path traversal)."""
+    if not _SAFE_SESSION_ID.match(session_id):
+        return None
+    path = SESSIONS_DIR / f"{session_id}.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return None
+
+def _list_sessions_local(limit: int = 30) -> list:
+    """Lista ostatnich sesji posortowana po dacie."""
+    sessions = []
+    for f in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+            sessions.append({
+                "id": data.get("id", f.stem),
+                "title": data.get("title", "Bez tytułu"),
+                "model": data.get("model", "?"),
+                "updated_at": data.get("updated_at", ""),
+                "msg_count": len(data.get("messages", [])),
+            })
+        except Exception:
+            continue
+    sessions.sort(key=lambda x: x["updated_at"], reverse=True)
+    return sessions[:limit]
+
+# ─── HTML INTERFACE ─────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cortex — Local AI Agent</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg:       #06080f;
+    --bg2:      #0c1220;
+    --bg3:      #111827;
+    --border:   #1e2d45;
+    --blue:     #3a8ad4;
+    --blue2:    #5aaee4;
+    --cyan:     #22d3ee;
+    --green:    #10b981;
+    --amber:    #f59e0b;
+    --red:      #ef4444;
+    --purple:   #a78bfa;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --dim:      #334155;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Space Grotesk', sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ─── HEADER ─── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 20px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo-hex {
+    width: 32px; height: 32px;
+    background: var(--blue);
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700; color: white;
+    font-family: 'JetBrains Mono', monospace;
+    flex-shrink: 0;
+  }
+
+  .logo-text {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .logo-text span {
+    color: var(--blue2);
+  }
+
+  .header-meta {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .status-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .model-badge {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    color: var(--purple);
+  }
+
+  .model-select {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px 8px;
+    font-size: 11px;
+    color: var(--purple);
+    font-family: 'JetBrains Mono', monospace;
+    cursor: pointer;
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23a78bfa'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 6px center;
+    padding-right: 20px;
+  }
+
+  .model-select:hover { border-color: var(--blue); }
+  .model-select:focus { border-color: var(--purple); }
+  .model-select option { background: var(--bg2); color: var(--text); }
+
+  .session-item {
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+    margin-bottom: 2px;
+  }
+  .session-item:hover { background: var(--bg3); }
+  .session-item.active { background: var(--bg3); border-left: 2px solid var(--blue); }
+  .session-title {
+    font-size: 12px;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+  .session-meta {
+    font-size: 10px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .new-chat-btn {
+    width: 100%;
+    background: var(--bg3);
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 8px;
+    color: var(--blue2);
+    font-size: 13px;
+    cursor: pointer;
+    font-family: 'Space Grotesk', sans-serif;
+    transition: border-color 0.15s;
+    margin-bottom: 8px;
+  }
+  .new-chat-btn:hover { border-color: var(--blue); }
+
+  /* ─── MAIN LAYOUT ─── */
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ─── SIDEBAR ─── */
+  .sidebar {
+    width: 220px;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow-y: auto;
+  }
+
+  .sidebar-section {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .sidebar-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .tool-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 13px;
+    color: var(--cyan);
+    margin: 2px;
+    font-family: 'JetBrains Mono', monospace;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .tool-chip:hover {
+    border-color: var(--blue);
+    background: #0d1e38;
+  }
+
+  .agent-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 0;
+    font-size: 12px;
+    cursor: default;
+  }
+
+  .agent-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    flex-shrink: 0;
+  }
+
+  .agent-name {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--blue2);
+    font-size: 11px;
+  }
+
+  .agent-role {
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  /* ─── CHAT AREA ─── */
+  .chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    scroll-behavior: smooth;
+  }
+
+  .messages::-webkit-scrollbar { width: 4px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 2px; }
+
+  /* ─── MESSAGE BUBBLES ─── */
+  .msg {
+    display: flex;
+    gap: 12px;
+    max-width: 860px;
+    animation: fadeIn 0.2s ease;
+    position: relative;
+  }
+
+  .msg-bubble { position: relative; }
+
+  .copy-btn {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+    font-family: 'JetBrains Mono', monospace;
+    z-index: 10;
+  }
+
+  .msg:hover .copy-btn { opacity: 1; }
+  .copy-btn:hover { color: var(--cyan); border-color: var(--blue); }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+
+  .msg-avatar {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .msg.user .msg-avatar {
+    background: #1e3a5f;
+    color: var(--blue2);
+  }
+
+  .msg.agent .msg-avatar {
+    background: #1a2d1a;
+    color: var(--green);
+    clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  }
+
+  .msg-bubble {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 18px;
+    font-size: 16px;
+    line-height: 1.75;
+    max-width: 720px;
+    word-break: break-word;
+  }
+
+  .msg.user .msg-bubble {
+    background: #0d1e38;
+    border-color: #1e3a5f;
+    border-radius: 12px 4px 12px 12px;
+  }
+
+  .msg.agent .msg-bubble {
+    border-radius: 4px 12px 12px 12px;
+  }
+
+  .msg-bubble pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    margin: 8px 0;
+    line-height: 1.5;
+  }
+
+  .msg-bubble code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    background: var(--bg3);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--cyan);
+  }
+
+  /* ─── TOOL CALL DISPLAY ─── */
+  .tool-call {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--amber);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: 6px 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--amber);
+  }
+
+  .tool-call .tool-name { font-weight: 700; }
+  .tool-call .tool-arg  { color: var(--muted); }
+  .tool-call .tool-result { color: var(--green); margin-top: 4px; white-space: pre-wrap; }
+
+  /* ─── THINKING BLOCK ─── */
+  .thinking-block {
+    background: var(--bg3);
+    border: 1px solid var(--dim);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: 6px 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--muted);
+    font-style: italic;
+  }
+
+  /* ─── TYPING INDICATOR ─── */
+  .typing-dots {
+    display: flex; gap: 4px; align-items: center;
+    padding: 4px 0;
+  }
+
+  .typing-dots span {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--blue);
+    animation: bounce 1.2s infinite;
+  }
+
+  .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+    30% { transform: translateY(-6px); opacity: 1; }
+  }
+
+  /* ─── INPUT AREA ─── */
+  .input-area {
+    padding: 16px 20px;
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .input-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 14px;
+    transition: border-color 0.15s;
+  }
+
+  .input-row:focus-within {
+    border-color: var(--blue);
+  }
+
+  textarea {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    resize: none;
+    min-height: 22px;
+    max-height: 200px;
+  }
+
+  textarea::placeholder { color: var(--muted); }
+
+  .send-btn {
+    width: 36px; height: 36px;
+    background: var(--blue);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    color: white;
+    font-size: 16px;
+    transition: background 0.15s, transform 0.1s;
+    flex-shrink: 0;
+  }
+
+  .send-btn:hover  { background: var(--blue2); }
+  .send-btn:active { transform: scale(0.95); }
+  .send-btn:disabled { background: var(--dim); cursor: not-allowed; }
+  .send-btn.stop { background: var(--red); }
+  .send-btn.stop:hover { background: #dc2626; }
+
+  .input-meta {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    align-items: center;
+  }
+
+  .toggle-btn {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 10px;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    transition: all 0.15s;
+  }
+
+  .toggle-btn.active {
+    border-color: var(--purple);
+    color: var(--purple);
+  }
+
+  .toggle-btn:hover { border-color: var(--blue); color: var(--blue2); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-hex">C</div>
+    <div class="logo-text"><span>Cortex</span> <span style="color:var(--muted);font-weight:300">Agent</span></div>
+  </div>
+  <div class="header-meta">
+    <div class="status-dot"></div>
+    <select id="model-select" class="model-select" onchange="switchModel(this.value)"></select>
+    <span id="cs-status" style="color:var(--muted)">CS ···</span>
+  </div>
+</header>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <button class="new-chat-btn" onclick="newChat()">+ Nowy chat</button>
+      <div class="sidebar-label">Historia</div>
+      <div id="session-list"></div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Tools</div>
+      <div class="tool-chip" onclick="insertCmd('list files in current directory')">bash</div>
+      <div class="tool-chip" onclick="insertCmd('show contents of ')">read_file</div>
+      <div class="tool-chip" onclick="insertCmd('edit file ')">edit_file</div>
+      <div class="tool-chip" onclick="insertCmd('search for ')">grep</div>
+      <div class="tool-chip" onclick="insertCmd('find files matching ')">glob</div>
+      <div class="tool-chip" onclick="insertCmd('list directory ')">list_dir</div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Quick actions</div>
+      <div class="tool-chip" onclick="insertCmd('show system info: CPU, RAM, disk')">system</div>
+      <div class="tool-chip" onclick="insertCmd('ollama list')">models</div>
+      <div class="tool-chip" onclick="insertCmd('git status')">git</div>
+    </div>
+  </div>
+
+  <div class="chat-area">
+    <div class="messages" id="messages">
+      <div class="msg agent">
+        <div class="msg-avatar">C</div>
+        <div class="msg-bubble">
+          <strong>Cortex</strong> — Local AI Agent powered by Ollama.<br><br>
+          Tools: bash, read/write/edit files, grep, glob. Policy Engine protects against dangerous operations.<br><br>
+          How can I help?
+        </div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-row">
+        <textarea id="input" placeholder="Napisz do agenta... (Enter = wyślij, Shift+Enter = nowa linia)" rows="1"
+          onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+        <button class="send-btn" id="send-btn" onclick="sendMessage()">➤</button>
+      </div>
+      <div class="input-meta">
+        <span>Enter — wyślij</span>
+        <span style="color:var(--dim)">·</span>
+        <button class="toggle-btn" id="think-btn" onclick="toggleThink()">think: OFF</button>
+        <button class="toggle-btn" onclick="clearChat()">wyczyść</button>
+        <span style="margin-left:auto" id="token-count"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let thinkMode = false;
+let isGenerating = false;
+let currentAgentBubble = null;
+let currentAgentContent = "";
+let currentThinkingBlock = null;
+let currentThinkingContent = "";
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    document.getElementById('cs-status').textContent = 'WS connected';
+    document.getElementById('cs-status').style.color = 'var(--green)';
+    // restore sesji po połączeniu
+    restoreFromLocalStorage();
+    loadSessions();
+  };
+
+  ws.onclose = () => {
+    document.getElementById('cs-status').textContent = 'reconnecting...';
+    document.getElementById('cs-status').style.color = 'var(--amber)';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    handleServerMsg(msg);
+  };
+}
+
+function handleServerMsg(msg) {
+  const messagesEl = document.getElementById('messages');
+
+  if (msg.type === 'start') {
+    removeTyping();
+    currentAgentContent = "";
+    currentThinkingBlock = null;
+    currentThinkingContent = "";
+    currentAgentBubble = createAgentBubble();
+    isGenerating = true;
+    setSendBtn(false);
+  }
+
+  else if (msg.type === 'thinking_delta') {
+    clearTypingDots();
+    if (!currentThinkingBlock) {
+      currentThinkingContent = "";
+      currentThinkingBlock = document.createElement('div');
+      currentThinkingBlock.className = 'thinking-block';
+      currentThinkingBlock.innerHTML = '<strong>thinking...</strong><br>';
+      if (currentAgentBubble) {
+        currentAgentBubble.appendChild(currentThinkingBlock);
+      }
+    }
+    currentThinkingContent += msg.content;
+    currentThinkingBlock.innerHTML = '<strong>💭 thinking</strong><br>' + escHtml(currentThinkingContent).replace(/\n/g, '<br>');
+    scrollBottom();
+  }
+
+  else if (msg.type === 'delta') {
+    clearTypingDots();
+    if (currentThinkingBlock) {
+      currentThinkingBlock.style.maxHeight = '120px';
+      currentThinkingBlock.style.overflow = 'hidden';
+      currentThinkingBlock.style.cursor = 'pointer';
+      currentThinkingBlock.onclick = function() {
+        this.style.maxHeight = this.style.maxHeight === 'none' ? '120px' : 'none';
+      };
+      currentThinkingBlock = null;
+    }
+    currentAgentContent += msg.content;
+    if (currentAgentBubble) {
+      currentAgentBubble.innerHTML = (currentAgentBubble.querySelector('.thinking-block') ? currentAgentBubble.querySelector('.thinking-block').outerHTML : '') + renderContent(currentAgentContent);
+    }
+    scrollBottom();
+  }
+
+  else if (msg.type === 'tool_call') {
+    const div = document.createElement('div');
+    div.className = 'tool-call';
+    div.innerHTML = `<span class="tool-name">▶ ${msg.name}</span> <span class="tool-arg">${escHtml(msg.arg || '')}</span>`;
+    div.id = `tc-${msg.id}`;
+    if (currentAgentBubble) {
+      currentAgentBubble.parentElement.after(div);
+    } else {
+      messagesEl.appendChild(div);
+    }
+    scrollBottom();
+  }
+
+  else if (msg.type === 'tool_result') {
+    const tcDiv = document.getElementById(`tc-${msg.id}`);
+    if (tcDiv) {
+      const res = document.createElement('div');
+      res.className = 'tool-result';
+      res.textContent = '→ ' + (msg.result || '').slice(0, 200);
+      tcDiv.appendChild(res);
+    }
+  }
+
+  else if (msg.type === 'done') {
+    isGenerating = false;
+    setSendBtn(true);
+    // dodaj copy button do ostatniego agent bubble
+    if (currentAgentBubble && !currentAgentBubble.querySelector('.copy-btn')) {
+      currentAgentBubble.insertAdjacentHTML('beforeend', '<button class="copy-btn" onclick="copyMsg(this)">copy</button>');
+    }
+    currentAgentBubble = null;
+    scrollBottom();
+    saveToLocalStorage();
+    loadSessions();
+  }
+
+  else if (msg.type === 'error') {
+    removeTyping();
+    isGenerating = false;
+    setSendBtn(true);
+    const errDiv = document.createElement('div');
+    errDiv.className = 'msg agent';
+    errDiv.innerHTML = `<div class="msg-avatar">!</div><div class="msg-bubble" style="border-color:var(--red);color:var(--red)">✗ ${escHtml(msg.content)}</div>`;
+    messagesEl.appendChild(errDiv);
+    scrollBottom();
+  }
+
+  else if (msg.type === 'status') {
+    const csEl = document.getElementById('cs-status');
+    csEl.textContent = msg.content;
+    csEl.style.color = msg.content.includes('online') ? 'var(--green)' : 'var(--amber)';
+  }
+
+  else if (msg.type === 'session_id') {
+    currentSessionId = msg.id;
+  }
+
+  else if (msg.type === 'session_loaded') {
+    // sesja załadowana na serwerze, kontekst przywrócony
+  }
+}
+
+function createAgentBubble() {
+  const messagesEl = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  div.innerHTML = '<div class="msg-avatar">C</div><div class="msg-bubble"><div class="typing-dots"><span></span><span></span><span></span></div><button class="copy-btn" onclick="copyMsg(this)">copy</button></div>';
+  messagesEl.appendChild(div);
+  return div.querySelector('.msg-bubble');
+}
+
+function renderContent(text) {
+  // prosty markdown: code blocks, inline code, bold
+  return text
+    .replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br>');
+}
+
+function addUserMessage(text) {
+  const messagesEl = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  div.innerHTML = `<div class="msg-avatar">U</div><div class="msg-bubble">${escHtml(text).replace(/\n/g,'<br>')}<button class="copy-btn" onclick="copyMsg(this)">copy</button></div>`;
+  messagesEl.appendChild(div);
+  scrollBottom();
+}
+
+function copyMsg(btn) {
+  const bubble = btn.closest('.msg-bubble');
+  if (!bubble) return;
+  // kopiuj tekst bez "copy" buttona
+  const clone = bubble.cloneNode(true);
+  clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+  const text = clone.innerText || clone.textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = '✓';
+    btn.style.color = 'var(--green)';
+    setTimeout(() => { btn.textContent = 'copy'; btn.style.color = ''; }, 1500);
+  }).catch(() => {
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    btn.textContent = '✓';
+    setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+  });
+}
+
+function clearTypingDots() {
+  if (currentAgentBubble) {
+    const dots = currentAgentBubble.querySelector('.typing-dots');
+    if (dots) dots.remove();
+  }
+}
+
+function addTyping() {
+  const messagesEl = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+  div.id = 'typing';
+  div.innerHTML = '<div class="msg-avatar">C</div><div class="msg-bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>';
+  messagesEl.appendChild(div);
+  scrollBottom();
+}
+
+function removeTyping() {
+  const t = document.getElementById('typing');
+  if (t) t.remove();
+}
+
+function sendMessage() {
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text || isGenerating || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  addUserMessage(text);
+  input.value = '';
+  autoResize(input);
+  addTyping();
+  setSendBtn(false);
+
+  ws.send(JSON.stringify({ type: 'message', content: text, think: thinkMode }));
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+}
+
+function setSendBtn(enabled) {
+  const btn = document.getElementById('send-btn');
+  if (enabled) {
+    btn.disabled = false;
+    btn.innerHTML = '➤';
+    btn.className = 'send-btn';
+    btn.onclick = sendMessage;
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = '■';
+    btn.className = 'send-btn stop';
+    btn.onclick = stopGeneration;
+  }
+}
+
+function stopGeneration() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'stop' }));
+  }
+  isGenerating = false;
+  setSendBtn(true);
+  removeTyping();
+  if (currentAgentBubble) {
+    clearTypingDots();
+    if (!currentAgentContent && !currentThinkingContent) {
+      currentAgentBubble.innerHTML = '<em style="color:var(--muted)">[zatrzymano]</em>';
+    }
+    currentAgentBubble = null;
+  }
+}
+
+function scrollBottom() {
+  const el = document.getElementById('messages');
+  el.scrollTop = el.scrollHeight;
+}
+
+function toggleThink() {
+  thinkMode = !thinkMode;
+  const btn = document.getElementById('think-btn');
+  btn.textContent = `think: ${thinkMode ? 'ON' : 'OFF'}`;
+  btn.className = 'toggle-btn' + (thinkMode ? ' active' : '');
+}
+
+function clearChat() {
+  if (isGenerating) return;
+  document.getElementById('messages').innerHTML = '';
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'clear' }));
+  }
+}
+
+function insertCmd(text) {
+  const input = document.getElementById('input');
+  input.value = text;
+  input.focus();
+  autoResize(input);
+}
+
+function escHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+let currentSessionId = null;
+
+// ─── SESSION MANAGEMENT ───
+function saveToLocalStorage() {
+  if (!currentSessionId) return;
+  const msgs = document.getElementById('messages').innerHTML;
+  localStorage.setItem('cortex_session_id', currentSessionId);
+  localStorage.setItem('cortex_session_html', msgs);
+}
+
+function restoreFromLocalStorage() {
+  const savedId = localStorage.getItem('cortex_session_id');
+  const savedHtml = localStorage.getItem('cortex_session_html');
+  if (savedId && savedHtml) {
+    currentSessionId = savedId;
+    document.getElementById('messages').innerHTML = savedHtml;
+    scrollBottom();
+    // reconnect do tej samej sesji
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'load_session', session_id: savedId }));
+    }
+    return true;
+  }
+  return false;
+}
+
+async function loadSessions() {
+  try {
+    const resp = await fetch('/api/sessions');
+    const data = await resp.json();
+    const list = document.getElementById('session-list');
+    list.innerHTML = '';
+    data.sessions.forEach(s => {
+      const div = document.createElement('div');
+      div.className = 'session-item' + (s.id === currentSessionId ? ' active' : '');
+      const date = s.updated_at ? new Date(s.updated_at).toLocaleDateString('pl-PL', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : '';
+      div.innerHTML = `<div class="session-title">${escHtml(s.title || 'Bez tytułu')}</div><div class="session-meta">${date} · ${s.msg_count} msg</div>`;
+      div.onclick = () => loadSession(s.id);
+      list.appendChild(div);
+    });
+  } catch(e) { console.error('loadSessions:', e); }
+}
+
+async function loadSession(id) {
+  if (isGenerating) return;
+  try {
+    const resp = await fetch(`/api/session/${id}`);
+    const data = await resp.json();
+    if (data.error) return;
+
+    currentSessionId = id;
+    const messagesEl = document.getElementById('messages');
+    messagesEl.innerHTML = '';
+
+    // odtwórz wiadomości z sesji
+    (data.messages || []).forEach(m => {
+      if (m.role === 'user') {
+        addUserMessage(m.content);
+      } else if (m.role === 'assistant' && m.content) {
+        const div = document.createElement('div');
+        div.className = 'msg agent';
+        div.innerHTML = `<div class="msg-avatar">C</div><div class="msg-bubble">${renderContent(m.content)}</div><button class="copy-btn" onclick="copyMsg(this)">copy</button>`;
+        messagesEl.appendChild(div);
+      }
+    });
+    scrollBottom();
+    saveToLocalStorage();
+    loadSessions(); // odśwież aktywny
+
+    // powiedz serwerowi żeby załadował kontekst
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'load_session', session_id: id }));
+    }
+  } catch(e) { console.error('loadSession:', e); }
+}
+
+function newChat() {
+  if (isGenerating) return;
+  document.getElementById('messages').innerHTML = `
+    <div class="msg agent">
+      <div class="msg-avatar">C</div>
+      <div class="msg-bubble">
+        <strong>Cortex</strong> — Local AI Agent powered by Ollama.<br><br>
+        Tools: bash, read/write/edit files, grep, glob. Policy Engine protects against dangerous operations.<br><br>
+        How can I help?
+      </div>
+    </div>`;
+  currentSessionId = null;
+  localStorage.removeItem('cortex_session_id');
+  localStorage.removeItem('cortex_session_html');
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'clear' }));
+  }
+  loadSessions();
+  document.getElementById('input').focus();
+}
+
+async function loadModels() {
+  try {
+    const resp = await fetch('/api/models');
+    const data = await resp.json();
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = '';
+    data.models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      const fitIcon = m.fit === 'ok' ? '✓' : m.fit === 'slow' ? '⚠' : m.fit === 'no' ? '✗' : '?';
+      opt.textContent = `${fitIcon} ${m.name} (${m.size})${m.tools ? ' 🔧' : ''}${m.thinking ? ' 💭' : ''}`;
+      if (m.fit === 'no') opt.style.color = '#ef4444';
+      if (m.fit === 'slow') opt.style.color = '#f59e0b';
+      if (m.name === data.current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  } catch(e) { console.error('loadModels:', e); }
+}
+
+async function switchModel(name) {
+  try {
+    const resp = await fetch('/api/model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: name})
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      const msgs = document.getElementById('messages');
+      const div = document.createElement('div');
+      div.className = 'msg agent';
+      div.innerHTML = '<div class="msg-avatar">⚙</div><div class="msg-bubble" style="color:var(--purple)">Model: <strong>' + escHtml(name) + '</strong></div>';
+      msgs.appendChild(div);
+      scrollBottom();
+    }
+  } catch(e) { console.error('switchModel:', e); }
+}
+
+// init
+setSendBtn(true);
+connect();
+loadModels();
+document.getElementById('input').focus();
+// sessions ładowane w ws.onopen po połączeniu
+</script>
+</body>
+</html>"""
+
+# ─── WEBSOCKET HANDLER ─────────────────────────────────────────────────────────
+# importuj logikę z agent.py i nowych modułów
+import importlib.util, sys as _sys
+_spec = importlib.util.spec_from_file_location(
+    "agent", str(Path(__file__).parent / "agent.py")
+)
+_agent = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_agent)
+
+execute_tool   = _agent.execute_tool
+call_ollama    = _agent.call_ollama
+TOOLS          = _agent.TOOLS
+build_system_prompt = _agent.build_system_prompt
+get_briefing   = _agent.get_briefing
+save_session_to_cs  = _agent.save_session_to_cs
+
+# Policy & Recovery & Compactor
+from policy import PolicyEngine, PolicyDecision
+from compactor import compact_messages, should_compact, estimate_tokens
+from recovery import RecoveryEngine
+
+_policy = PolicyEngine()
+_recovery = RecoveryEngine(
+    fallback_fn=_agent.call_anthropic if _agent.ANTHROPIC_KEY else None,
+    compact_fn=lambda msgs: compact_messages(msgs, OLLAMA_URL, OLLAMA_MODEL, keep_last=6),
+)
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTML
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+
+    briefing = get_briefing()
+    session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    messages   = [{"role": "system", "content": build_system_prompt(briefing)}]
+    stop_event = asyncio.Event()
+
+    # sprawdź CS
+    try:
+        r = requests.get(f"{CS_URL}/health", timeout=2)
+        cs_ok = r.ok
+    except Exception:
+        cs_ok = False
+
+    await ws.send_json({"type": "status", "content": "CS online" if cs_ok else "CS offline"})
+    await ws.send_json({"type": "session_id", "id": session_id})
+
+    # kolejka na przychodzące wiadomości WebSocket
+    ws_queue = asyncio.Queue()
+
+    async def _ws_reader():
+        """Czytaj wiadomości z WebSocket w tle."""
+        try:
+            while True:
+                data = await ws.receive_json()
+                if data.get("type") == "stop":
+                    stop_event.set()
+                else:
+                    await ws_queue.put(data)
+        except WebSocketDisconnect:
+            await ws_queue.put(None)
+
+    reader_task = asyncio.create_task(_ws_reader())
+
+    try:
+        while True:
+            data = await ws_queue.get()
+            if data is None:
+                break
+
+            if data.get("type") == "clear":
+                messages = [{"role": "system", "content": build_system_prompt(get_briefing())}]
+                session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                await ws.send_json({"type": "session_id", "id": session_id})
+                continue
+
+            if data.get("type") == "load_session":
+                old_id = data.get("session_id", "")
+                loaded = _load_session_local(old_id)
+                if loaded:
+                    session_id = old_id
+                    messages = [{"role": "system", "content": build_system_prompt(get_briefing())}]
+                    # ogranicz do ostatnich 10 wiadomości żeby nie przeciążyć modelu
+                    old_msgs = loaded.get("messages", [])
+                    if len(old_msgs) > 10:
+                        old_msgs = old_msgs[-10:]
+                    messages.extend(old_msgs)
+                    await ws.send_json({"type": "session_loaded", "session": loaded})
+                else:
+                    await ws.send_json({"type": "error", "content": f"Sesja {old_id} nie znaleziona"})
+                continue
+
+            if data.get("type") != "message":
+                continue
+
+            stop_event.clear()
+
+            user_text = data.get("content", "").strip()
+            think     = data.get("think", False)
+            if not user_text:
+                continue
+
+            messages.append({"role": "user", "content": user_text})
+            await ws.send_json({"type": "start"})
+
+            # agent loop z WebSocket streaming
+            loop_count = 0
+            error_sent = False
+            while loop_count < _agent.MAX_TOOL_LOOPS:
+                loop_count += 1
+
+                # context compression
+                if should_compact(messages, _agent.CONTEXT_MAX_TOKENS):
+                    messages = compact_messages(
+                        messages, OLLAMA_URL, OLLAMA_MODEL,
+                        keep_last=6, max_tokens=_agent.CONTEXT_MAX_TOKENS
+                    )
+                    await ws.send_json({"type": "status", "content": f"[kompresja kontekstu]"})
+
+                # streaming delta przez WebSocket
+                full_content = ""
+                tool_calls   = []
+                collected    = {"content": "", "tc": []}
+
+                # wywołaj Ollama streaming (w thread pool żeby nie blokować asyncio)
+                payload = {
+                    "model":    OLLAMA_MODEL,
+                    "messages": messages,
+                    "tools":    TOOLS,
+                    "stream":   True,
+                    "think":    think,
+                    "options":  {"temperature": 0.7, "num_ctx": int(os.getenv("NUM_CTX", "32768"))}
+                }
+
+                queue = asyncio.Queue()
+
+                def _stream_ollama():
+                    """Synchroniczny streaming w osobnym wątku — chunks do queue."""
+                    try:
+                        resp = requests.post(
+                            f"{OLLAMA_URL}/api/chat",
+                            json=payload, stream=True, timeout=300
+                        )
+                        resp.raise_for_status()
+                        for line in resp.iter_lines():
+                            if stop_event.is_set():
+                                resp.close()
+                                queue.put_nowait({"_stopped": True})
+                                return
+                            if not line:
+                                continue
+                            try:
+                                chunk = json.loads(line)
+                            except Exception:
+                                continue
+                            queue.put_nowait(chunk)
+                            if chunk.get("done"):
+                                break
+                    except Exception as e:
+                        queue.put_nowait({"_error": str(e)})
+                    finally:
+                        queue.put_nowait(None)  # sentinel
+
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(None, _stream_ollama)
+
+                # konsumuj chunks async
+                stopped = False
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        break
+                    if "_stopped" in chunk:
+                        stopped = True
+                        break
+                    if "_error" in chunk:
+                        await ws.send_json({"type": "error", "content": f"Ollama: {chunk['_error']}"})
+                        error_sent = True
+                        break
+
+                    msg = chunk.get("message", {})
+
+                    # thinking tokens
+                    thinking_delta = msg.get("thinking", "")
+                    if thinking_delta:
+                        await ws.send_json({"type": "thinking_delta", "content": thinking_delta})
+
+                    delta = msg.get("content", "")
+                    if delta:
+                        collected["content"] += delta
+                        await ws.send_json({"type": "delta", "content": delta})
+
+                    if msg.get("tool_calls"):
+                        collected["tc"].extend(msg["tool_calls"])
+
+                    if chunk.get("done"):
+                        break
+
+                if error_sent or stopped:
+                    if stopped and collected["content"]:
+                        messages.append({"role": "assistant", "content": collected["content"] + "\n[przerwano]"})
+                    break
+
+                tool_calls = collected["tc"]
+                full_content = collected["content"]
+
+                if not tool_calls:
+                    # finalna odpowiedź
+                    messages.append({"role": "assistant", "content": full_content})
+                    break
+
+                # tool calls
+                messages.append({
+                    "role": "assistant",
+                    "content": full_content,
+                    "tool_calls": tool_calls
+                })
+
+                tool_results = []
+                for i, tc in enumerate(tool_calls):
+                    fn   = tc.get("function", {})
+                    name = fn.get("name", "")
+                    raw_args = fn.get("arguments", {})
+                    if isinstance(raw_args, dict):
+                        args = raw_args
+                    else:
+                        try:
+                            args = json.loads(raw_args)
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+
+                    tc_id = f"{session_id}_{loop_count}_{i}"
+                    arg_preview = args.get("command") or args.get("path") or args.get("content","")[:40] or ""
+
+                    # Policy check
+                    decision, reason = _policy.check(name, args)
+                    if decision == PolicyDecision.DENY:
+                        await ws.send_json({"type": "tool_call", "name": f"[DENY] {name}", "arg": reason, "id": tc_id})
+                        tool_results.append({"role": "tool", "content": f"[ZABLOKOWANE] {reason}", "name": name})
+                        continue
+
+                    if decision == PolicyDecision.ASK:
+                        await ws.send_json({"type": "tool_call", "name": f"[ASK→OK] {name}", "arg": f"{arg_preview} ({reason})", "id": tc_id})
+                    else:
+                        await ws.send_json({"type": "tool_call", "name": name, "arg": arg_preview, "id": tc_id})
+
+                    # wykonaj tool w thread pool
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, execute_tool, name, args
+                    )
+
+                    await ws.send_json({"type": "tool_result", "id": tc_id, "result": result[:300]})
+                    tool_results.append({"role": "tool", "content": result, "name": name})
+
+                messages.extend(tool_results)
+
+            await ws.send_json({"type": "done"})
+
+            # auto-save
+            _save_session_local(session_id, messages)
+            save_session_to_cs(session_id, messages)
+
+    except (WebSocketDisconnect, Exception):
+        stop_event.set()
+        reader_task.cancel()
+        save_session_to_cs(session_id, messages)
+
+def _get_ram_gb() -> float:
+    """Pobierz ilość dostępnego RAM w GB."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    return kb / 1024 / 1024
+    except Exception:
+        pass
+    return 0
+
+def _model_fits(param_size_str: str, ram_gb: float) -> str:
+    """Sprawdź czy model zmieści się w RAM. Zwraca: ok/slow/no."""
+    try:
+        # parsuj rozmiar: "31.3B" -> 31.3, "7B" -> 7
+        num = float(param_size_str.replace("B", "").strip())
+    except (ValueError, AttributeError):
+        return "unknown"
+    # heurystyka: model potrzebuje ~1.2x parametrów w GB RAM (Q4 quantization)
+    ram_needed = num * 0.6  # Q4_K_M: ~0.6 GB per billion params
+    available = ram_gb * 0.75  # zostaw 25% na system
+    if ram_needed <= available:
+        return "ok"
+    elif ram_needed <= ram_gb:
+        return "slow"  # zmieści się ale mało RAM na resztę
+    return "no"
+
+@app.get("/api/models")
+async def list_models():
+    """Lista modeli z Ollama z info o capabilities i kompatybilności."""
+    ram_gb = _get_ram_gb()
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        models = []
+        for m in r.json().get("models", []):
+            name = m["name"]
+            param_size = m.get("details", {}).get("parameter_size", "?")
+            # pobierz capabilities
+            try:
+                show = requests.post(f"{OLLAMA_URL}/api/show", json={"model": name}, timeout=5)
+                caps = show.json().get("capabilities", [])
+            except Exception:
+                caps = []
+            models.append({
+                "name": name,
+                "size": param_size,
+                "tools": "tools" in caps,
+                "thinking": "thinking" in caps,
+                "fit": _model_fits(param_size, ram_gb),
+            })
+        # sortuj: tools first, potem po rozmiarze
+        models.sort(key=lambda x: (not x["tools"], x["name"]))
+        return {"models": models, "current": OLLAMA_MODEL, "ram_gb": round(ram_gb, 1)}
+    except Exception as e:
+        return {"models": [], "current": OLLAMA_MODEL, "error": str(e)}
+
+@app.post("/api/model")
+async def switch_model(body: dict):
+    """Zmień aktywny model."""
+    global OLLAMA_MODEL
+    new_model = body.get("model", "")
+    if not new_model:
+        return {"ok": False, "error": "no model specified"}
+    OLLAMA_MODEL = new_model
+    # zaktualizuj też w agent module
+    _agent.OLLAMA_MODEL = new_model
+    return {"ok": True, "model": OLLAMA_MODEL}
+
+@app.get("/api/sessions")
+async def list_sessions():
+    """Lista zapisanych sesji."""
+    return {"sessions": _list_sessions_local()}
+
+@app.get("/api/session/{session_id}")
+async def get_session(session_id: str):
+    """Załaduj sesję."""
+    data = _load_session_local(session_id)
+    if data:
+        return data
+    return {"error": "not found"}
+
+@app.delete("/api/session/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session."""
+    if not _SAFE_SESSION_ID.match(session_id):
+        return {"ok": False, "error": "invalid session id"}
+    path = SESSIONS_DIR / f"{session_id}.json"
+    if path.exists():
+        path.unlink()
+        return {"ok": True}
+    return {"ok": False, "error": "not found"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model": OLLAMA_MODEL, "agent": AGENT_NAME}
+
+if __name__ == "__main__":
+    import webbrowser, threading
+    url = f"http://localhost:{WEB_PORT}"
+    print(f"Cortex Web UI")
+    print(f"Model:  {OLLAMA_MODEL}")
+    print(f"CS:     {CS_URL}")
+    print(f"URL:    {url}")
+    threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+    host = os.getenv("WEB_HOST", "127.0.0.1")
+    uvicorn.run(app, host=host, port=WEB_PORT, log_level="warning")
