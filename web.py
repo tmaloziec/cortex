@@ -7,8 +7,10 @@ Otwórz:  http://localhost:8080
 """
 
 import os
+import re
 import sys
 import json
+import logging
 import datetime
 import secrets
 import tempfile
@@ -53,6 +55,28 @@ if _extra_origins:
 
 # Maximum length of a user message sent over WebSocket (defense-in-depth)
 WS_MAX_MESSAGE_CHARS = int(os.getenv("WS_MAX_MESSAGE_CHARS", "16384"))
+
+# Redact ?token=... from uvicorn access logs. Bootstrap URL still contains the
+# token (Jupyter-style), but access logs, rotated files and log shippers should
+# not persist it. WebSocket and REST paths that carry ?token=... are redacted too.
+_TOKEN_QS_RE = re.compile(r"(token=)[^&\s\"']+", re.IGNORECASE)
+
+class _TokenRedactFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    _TOKEN_QS_RE.sub(r"\1REDACTED", a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+            if isinstance(record.msg, str):
+                record.msg = _TOKEN_QS_RE.sub(r"\1REDACTED", record.msg)
+        except Exception:
+            pass
+        return True
+
+for _name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
+    logging.getLogger(_name).addFilter(_TokenRedactFilter())
 
 # Locks per-session-id for atomic writes
 _SESSION_LOCKS: dict = {}
@@ -918,8 +942,11 @@ function createAgentBubble() {
 }
 
 function renderContent(text) {
-  // prosty markdown: code blocks, inline code, bold
-  return text
+  // Escape first, THEN apply markdown regex. Otherwise any < > " inside
+  // code blocks or outside gets rendered as HTML — XSS vector if model
+  // echoes attacker-controlled content. escHtml preserves backticks, so
+  // the ``` and ` patterns still match after escaping.
+  return escHtml(text)
     .replace(/```(\w*)\n?([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')

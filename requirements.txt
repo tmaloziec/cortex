@@ -1,6 +1,10 @@
-# Cortex — dependencies
-requests>=2.31.0
-fastapi>=0.110.0
-uvicorn>=0.27.0
-websockets>=12.0
-# anthropic>=0.25.0    # optional: uncomment for Anthropic API fallback
+# Cortex — dependencies (pinned for reproducible installs and CVE tracking)
+#
+# Refresh policy: run `pip-audit -r requirements.txt` and bump pins quarterly,
+# or sooner when a CVE is disclosed. Keep minor/patch upgrades within a
+# single PR and run `python ws_test.py` against a live instance first.
+requests==2.32.3
+fastapi==0.115.6
+uvicorn==0.32.1
+websockets==13.1
+# anthropic==0.40.0    # optional: uncomment for Anthropic API fallback

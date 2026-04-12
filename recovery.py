@@ -110,15 +110,22 @@ class RecoveryEngine:
                     if isinstance(raw_args, str):
                         try:
                             json.loads(raw_args)
-                        except json.JSONDecodeError:
+                        except json.JSONDecodeError as e:
                             bad_json = True
+                            log.warning(
+                                "Bad JSON in tool_calls for %s: %s — raw=%r",
+                                fn.get("name", "?"), e, raw_args[:200]
+                            )
                             tc["function"]["arguments"] = "{}"
 
                 if bad_json and attempt < recipe["max_retries"]:
                     log.warning(f"Bad JSON in tool_calls, retry {attempt+1}")
+                    # Use a system-role hint (not a fake [SYSTEM] prefix in a
+                    # user message, which would let a malicious tool output
+                    # forge the same marker and inject instructions).
                     messages.append({
-                        "role": "user",
-                        "content": "[SYSTEM] Your last response contained invalid JSON in tool arguments. Please retry with valid JSON."
+                        "role": "system",
+                        "content": "Your previous response contained invalid JSON in tool arguments. Please retry with strictly valid JSON for all tool calls."
                     })
                     time.sleep(0.5)
                     continue
@@ -150,8 +157,8 @@ class RecoveryEngine:
                     try:
                         result = self.fallback_fn(messages)
                         return result, messages
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning("fallback after ConnectionError failed: %s", e)
                 return None, messages
 
             except KeyboardInterrupt:
@@ -168,8 +175,8 @@ class RecoveryEngine:
                     try:
                         result = self.fallback_fn(messages)
                         return result, messages
-                    except Exception:
-                        pass
+                    except Exception as fbe:
+                        log.warning("fallback after API error failed: %s", fbe)
                 return None, messages
 
         return None, messages
@@ -213,8 +220,8 @@ class RecoveryEngine:
             try:
                 self.alert_fn(error_type, message)
                 return True
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("alert_fn failed: %s", e)
         log.error(f"ALERT [{error_type}]: {message}")
         return False
 

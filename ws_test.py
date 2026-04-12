@@ -53,11 +53,14 @@ async def run_tests():
 
     results = []
 
-    # Disable ping to avoid keepalive timeout with slow CPU model
+    # Long ping_interval (instead of None) keeps the connection alive on slow
+    # CPU models without wedging the test if the server silently goes away —
+    # the client will close the socket after ping_timeout seconds of no reply
+    # rather than hang forever.
     async with websockets.connect(
         WS_URL,
-        ping_interval=None,
-        ping_timeout=None,
+        ping_interval=60,
+        ping_timeout=30,
         open_timeout=15,
     ) as ws:
 

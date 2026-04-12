@@ -76,6 +76,18 @@ Cortex includes a rule-based policy engine that checks every tool call before ex
 
 Custom rules can be added via a `policy.json` file.
 
+## Security
+
+Cortex is a **local, single-user AI agent**. It trusts the operator of the
+machine, the local Ollama instance, and any plugin you load. Filesystem
+and shell access are intentionally unsandboxed so the agent can do real
+work on your behalf — think `bash`, not browser.
+
+Before deploying outside a single-user workstation (shared host, exposed
+network, untrusted plugins), read [SECURITY.md](SECURITY.md). It documents
+the threat model, the design decisions that look like vulnerabilities but
+aren't, and how to report real security issues.
+
 ## Plugins
 
 Cortex supports plugins that add custom tools and modes. Plugins are Python files placed in the `plugins/` directory.

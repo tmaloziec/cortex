@@ -5,9 +5,13 @@ Wzorowane na Claude Code permission system (Allow/Deny/Ask).
 """
 
 import re
+import copy
 import json
+import logging
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 # ─── DEFAULT POLICIES ─────────────────────────────────────────────────────────
 # Ładowane jeśli brak policy.json
@@ -149,7 +153,9 @@ def _get_check_value(tool_name: str, args: dict) -> str:
 
 class PolicyEngine:
     def __init__(self, policy_file: Optional[str] = None):
-        self.policies = DEFAULT_POLICIES.copy()
+        # deepcopy: DEFAULT_POLICIES contains nested lists; shallow copy would
+        # make two PolicyEngine instances share the same underlying lists.
+        self.policies = copy.deepcopy(DEFAULT_POLICIES)
         self.user_overrides: dict = {}
 
         # zaladuj custom policies jesli sa
@@ -159,8 +165,8 @@ class PolicyEngine:
                 try:
                     custom = json.loads(pf.read_text())
                     self._merge_policies(custom)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("Failed to load custom policy %s: %s", pf, e)
 
     def _merge_policies(self, custom: dict):
         """Merge custom policies z default."""
@@ -187,7 +193,7 @@ class PolicyEngine:
         # deny first
         for pattern in rules.get("deny", []):
             try:
-                if re.search(pattern, value, re.IGNORECASE):
+                if re.search(pattern, value, re.IGNORECASE | re.DOTALL):
                     return PolicyDecision.DENY, f"Zablokowane przez regułę: {pattern}"
             except re.error:
                 continue
@@ -195,7 +201,7 @@ class PolicyEngine:
         # then ask
         for pattern in rules.get("ask", []):
             try:
-                if re.search(pattern, value, re.IGNORECASE):
+                if re.search(pattern, value, re.IGNORECASE | re.DOTALL):
                     return PolicyDecision.ASK, f"Wymaga potwierdzenia: {pattern}"
             except re.error:
                 continue
@@ -203,7 +209,7 @@ class PolicyEngine:
         # then allow
         for pattern in rules.get("allow", []):
             try:
-                if re.search(pattern, value, re.IGNORECASE):
+                if re.search(pattern, value, re.IGNORECASE | re.DOTALL):
                     return PolicyDecision.ALLOW, "OK"
             except re.error:
                 continue

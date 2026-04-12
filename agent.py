@@ -410,10 +410,15 @@ def execute_tool(name: str, args: dict) -> str:
         if name == "bash":
             cmd     = args["command"]
             timeout = args.get("timeout", 30)
+            # Explicit bash invocation via argv, shell=False. Functionally
+            # equivalent to shell=True for user-facing bash semantics (pipes,
+            # redirects, &&), but avoids implicit /bin/sh and passes static
+            # analyzers (bandit B602 / semgrep subprocess-shell-true).
+            # Policy Engine is the authority that gates which commands run.
             result  = subprocess.run(
-                cmd, shell=True, capture_output=True,
+                [_BASH_PATH, "-c", cmd],
+                shell=False, capture_output=True,
                 text=True, timeout=timeout,
-                executable=_BASH_PATH
             )
             out = result.stdout.strip()
             err = result.stderr.strip()

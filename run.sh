@@ -6,28 +6,47 @@
 #   ./run.sh worker   — daemon (poll CS → execute → report)
 #   ./run.sh worker --once  — one task and exit
 
-set -e
+set -euo pipefail
 
-DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Portable script path resolution (readlink -f isn't available on macOS by default).
+_resolve_path() {
+    local src="$1"
+    while [ -L "$src" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+        src="$(readlink "$src")"
+        [[ "$src" != /* ]] && src="$dir/$src"
+    done
+    echo "$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+}
+DIR="$(_resolve_path "${BASH_SOURCE[0]}")"
 cd "$DIR"
 
-# Venv
+# Venv — install from requirements.txt (pinned versions, hash-friendly)
 if [ ! -d "$DIR/venv" ]; then
     echo "Creating venv..."
     python3 -m venv "$DIR/venv"
+    # shellcheck disable=SC1091
     source "$DIR/venv/bin/activate"
-    pip install -q fastapi uvicorn websockets requests
+    pip install -q --upgrade pip
+    pip install -q -r "$DIR/requirements.txt"
 else
+    # shellcheck disable=SC1091
     source "$DIR/venv/bin/activate"
 fi
 
-# Auto-detect GPU
-if nvidia-smi &>/dev/null; then
-    export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:26b}"
-    echo "[GPU] Model: $OLLAMA_MODEL"
+# Auto-detect GPU. Only set OLLAMA_MODEL if the user hasn't set one —
+# respect env and never overwrite an explicit choice.
+if [ -z "${OLLAMA_MODEL:-}" ]; then
+    if nvidia-smi &>/dev/null; then
+        export OLLAMA_MODEL="gemma4:26b"
+        echo "[GPU] Model: $OLLAMA_MODEL (auto)"
+    else
+        export OLLAMA_MODEL="gemma4:e4b"
+        echo "[CPU] Model: $OLLAMA_MODEL (auto)"
+    fi
 else
-    export OLLAMA_MODEL="${OLLAMA_MODEL:-gemma4:e4b}"
-    echo "[CPU] Model: $OLLAMA_MODEL"
+    echo "[env] Model: $OLLAMA_MODEL"
 fi
 
 # CS URL — Consciousness Server (optional)
