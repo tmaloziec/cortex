@@ -38,6 +38,10 @@ _ARGV0_DENY = {
     # Scanners — require plugin opt-in
     "nmap", "masscan", "nikto", "sqlmap", "thehoneyharvester", "theharvester",
     "dirb", "gobuster", "hydra", "patator", "medusa",
+    # Reverse-shell / egress helpers. `curl` and `wget` intentionally NOT
+    # on this list — they have too many legitimate uses; the regex pass
+    # handles their dangerous forms (pipe-to-shell).
+    "nc", "ncat", "socat",
 }
 
 def _argv0_check(cmd: str) -> Optional[str]:
@@ -103,7 +107,10 @@ DEFAULT_POLICIES = {
             # ── SYSTEM DESTRUCTION ──
             r"rm\s+(-[a-zA-Z]*f|-[a-zA-Z]*r|--force|--recursive)\s+/",  # rm -rf / or /anything
             r"rm\s+-[a-zA-Z]*\s+/",              # rm with any flags targeting /
-            r":(){ :\|:& };:",                  # fork bomb
+            # Fork bomb: ``:(){ :|:& };:``. The parentheses and braces are
+            # regex metacharacters; the original pattern here was dead code
+            # (matched nothing). Escape them and allow optional whitespace.
+            r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
             r"shutdown",
             r"reboot",
             r"init\s+[06]",
@@ -121,6 +128,22 @@ DEFAULT_POLICIES = {
             r"cat.*/etc/shadow",
             r"cat.*\.ssh/id_",
             r"cat.*\.gnupg/",
+            # Environment dump leaks ANTHROPIC_API_KEY, WEB_TOKEN, CS_URL, etc.
+            # Deny the literal forms; attacker can still `printf "%s" "$FOO"`,
+            # so this is heuristic — see the module header and SECURITY.md.
+            r"^\s*env(\s|$)",
+            r"^\s*printenv(\s|$)",
+            r"^\s*export(\s|$)",  # `export -p` dumps; other forms benign
+            r"\$\{?ANTHROPIC_API_KEY\}?",
+            r"\$\{?WEB_TOKEN\}?",
+            # Reverse-shell one-liners commonly used post-injection.
+            r"\bnc\b.*\s-e\b",
+            r"\bncat\b.*\s-e\b",
+            r"/dev/tcp/",                      # bash TCP redirect
+            r"bash\s+-i\s+>&\s*/dev/tcp",
+            # base64 / xxd piped to shell — classic obfuscated RCE.
+            r"base64\s+-d\b.*\|\s*(bash|sh|zsh)",
+            r"xxd\s+-r.*\|\s*(bash|sh|zsh)",
 
             # ── Network scanning tools — require plugin or explicit approval ──
             r"\bnmap\b",
@@ -137,114 +160,136 @@ DEFAULT_POLICIES = {
             r".*",  # everything not denied
         ]
     },
+    # Writing to these is a persistent-RCE foothold. Any prompt-injected
+    # write_file / edit_file call lands on a file that a later human or
+    # system action runs — shell launches, vim/git/python invocations, cron
+    # ticks, systemd user units. The list is defined once and reused by
+    # write_file and edit_file so the two tools can't drift apart.
+    "_PERSISTENCE_DENY": [
+        # SSH: config/rc/env add persistence via ProxyCommand or
+        # LocalCommand; id_/authorized_keys remain denied too.
+        r"\.ssh/",
+        r"\.gnupg/",
+        # Shell init files (bash, zsh, sh, fish) and their .d/ drop-ins.
+        r"\.bashrc$", r"\.bash_profile$", r"\.bash_login$", r"\.bash_logout$",
+        r"\.bashrc\.d/",
+        r"\.zshrc$", r"\.zshenv$", r"\.zprofile$", r"\.zlogin$",
+        r"\.zshrc\.d/",
+        r"\.profile$",
+        r"\.inputrc$",
+        r"\.config/fish/", r"(^|/)fish/config\.fish$",
+        # X11 / Wayland / desktop-session init files.
+        r"\.xinitrc$", r"\.xsession$", r"\.xsessionrc$", r"\.xprofile$",
+        # XDG-style triggers: systemd user units, autostart, env.d, apps.
+        r"\.config/systemd/user/",
+        r"\.config/autostart/",
+        r"\.config/environment\.d/",
+        r"\.local/share/applications/.*\.desktop$",
+        # Cron.
+        r"(^|/)crontab$",
+        r"/var/spool/cron/",
+        r"/etc/cron",
+        # Python site-packages .pth — runs on every python invocation.
+        r"site-packages/.*\.pth$",
+        # VCS alias/hook persistence. `.git/hooks/` is the obvious one; a
+        # crafted `.gitconfig` [alias] runs on the next `git <alias>`.
+        r"\.git/hooks/",
+        r"\.gitconfig$", r"\.config/git/config$",
+        # Editor startup files — vim/neovim run code on first invocation.
+        r"\.vimrc$", r"\.gvimrc$",
+        r"\.config/nvim/init\.(vim|lua)$",
+        # Python / Node / pip global configs — alter what gets imported or
+        # fetched next time the user runs pip/npm/python.
+        r"\.config/pip/pip\.conf$", r"(^|/)pip\.conf$", r"\.pip/pip\.conf$",
+        r"\.npmrc$", r"\.pypirc$",
+        # Cortex's own plugin directory: importlib-loaded at startup =
+        # persistent RCE on next `python agent.py`.
+        r"(^|/)plugins/.*\.py$",
+    ],
+
+    # Anything holding a live credential should be off-limits to both read
+    # paths (exfil) and write paths (poisoning / overwriting with attacker
+    # keys). Kept as one list and applied to read_file / write_file /
+    # edit_file / grep_search / list_dir so a single tool can't sneak past
+    # the others.
+    "_CREDENTIAL_DENY": [
+        # Use (/|$) so list_dir on the directory itself is also denied —
+        # just enumerating ~/.aws or ~/.ssh leaks profile names.
+        r"\.ssh(/|$)",
+        r"\.gnupg(/|$)",
+        r"(^|/)shadow$",
+        r"\.env($|\.)",
+        r"\.envrc$",
+        r"\.aws(/|$)",
+        r"\.azure(/|$)",
+        r"\.gcloud(/|$)",
+        r"\.kube/config",
+        r"\.docker/config\.json",
+        r"\.netrc$",
+        r"\.git-credentials$",
+        r"\.config/.*(token|credentials|secret|apikey|api_key)",
+    ],
+
+    # Historical files often contain typed passwords, tokens, or sensitive
+    # command lines; read_file blocks them even though writing is generally
+    # harmless.
+    "_HISTORY_DENY": [
+        r"\.bash_history$", r"\.zsh_history$", r"\.python_history$",
+        r"\.lesshst$", r"\.mysql_history$", r"\.psql_history$",
+        r"\.node_repl_history$",
+    ],
+
+    # System paths the user should never overwrite via the agent tool
+    # (even as root — we intentionally make this hurt to typo).
+    "_SYSTEM_DIRS_DENY": [
+        r"^/boot/",
+        r"^/usr/",
+        r"^/bin/",
+        r"^/sbin/",
+        r"^/etc/",
+    ],
+
+    # _PLACEHOLDERS_: the three underscore-prefixed keys above are merged
+    # into the real tool rules below by _expand_shared_lists(); they are
+    # not tool names themselves.
     "write_file": {
         "deny": [
-            # system directories
-            r"^/boot/",
-            r"^/usr/",
-            r"^/bin/",
-            r"^/sbin/",
-            r"^/etc/",
-            # credentials
-            r"\.ssh/id_",
-            r"\.ssh/authorized_keys",
-            r"\.gnupg/",
-            # Shell/session persistence — prompt injection + write_file would
-            # otherwise be a one-shot backdoor (reverse shell on next login).
-            r"\.bashrc$", r"\.bash_profile$", r"\.bash_login$", r"\.bash_logout$",
-            r"\.zshrc$", r"\.zshenv$", r"\.zprofile$", r"\.zlogin$",
-            r"\.profile$",
-            r"\.inputrc$",
-            # Cron and systemd user units — another persistence vector.
-            r"(^|/)crontab$",
-            r"/var/spool/cron/",
-            r"\.config/systemd/user/",
-            r"\.config/autostart/",
-            # Dropping code into Cortex's own plugin directory = auto-RCE on
-            # next startup (plugins/ is importlib-loaded at boot).
-            r"(^|/)plugins/.*\.py$",
-            # Other persistence-rich dotfiles.
-            r"\.git/hooks/",
+            # filled in by _expand_shared_lists() from the three lists above
         ],
         "ask": [],
-        "allow": [
-            r".*",  # everything not denied
-        ]
+        "allow": [r".*"],
     },
     "read_file": {
         "deny": [
-            # Traditional creds
-            r"\.ssh/id_",
-            r"\.ssh/authorized_keys",
-            r"\.gnupg/",
-            r"shadow$",
-            # Dotenv / cloud / tool credentials — prompt injection could
-            # otherwise silently ship these to an external tool output.
-            r"\.env($|\.)",
-            r"\.aws/",
-            r"\.azure/",
-            r"\.gcloud/",
-            r"\.kube/config",
-            r"\.docker/config\.json",
-            r"\.npmrc$", r"\.pypirc$",
-            r"\.netrc$",
-            r"\.git-credentials$",
-            r"\.config/.*(token|credentials|secret|apikey|api_key)",
-            # Shell & language history — often contains typed passwords.
-            r"\.bash_history$", r"\.zsh_history$", r"\.python_history$",
-            r"\.lesshst$", r"\.mysql_history$", r"\.psql_history$",
-            # Other users' Cortex sessions.
-            r"\.cortex/sessions/",
+            # filled in by _expand_shared_lists()
         ],
-        "allow": [".*"]
+        "allow": [r".*"],
     },
     "list_dir": {
-        "allow": [".*"]
+        "deny": [
+            # credential dirs shouldn't be enumerable either — listing
+            # ~/.aws tells the attacker "here are the profiles I can try"
+        ],
+        "allow": [r".*"],
     },
-    "cs_note": {
-        "allow": [".*"]
-    },
-    "cs_task": {
-        "allow": [".*"]
-    },
-    "cs_briefing": {
-        "allow": [".*"]
-    },
+    "cs_note": {"allow": [r".*"]},
+    "cs_task": {"allow": [r".*"]},
+    "cs_briefing": {"allow": [r".*"]},
     "grep_search": {
-        "allow": [".*"]
+        "deny": [
+            # filled in by _expand_shared_lists() — otherwise grep_search
+            # is an obvious bypass of read_file's credential list.
+        ],
+        "allow": [r".*"],
     },
     "edit_file": {
         "deny": [
-            r"^/etc/",
-            r"^/boot/",
-            r"^/usr/",
-            r"^/bin/",
-            r"^/sbin/",
-            r"\.ssh/",
-            r"\.gnupg/",
-            r"\.env($|\.)",
-            # Persistence hooks — same list as write_file. Keeping both in
-            # sync matters; edit_file w/o these denies lets a reverse shell
-            # line be appended to an existing ~/.bashrc.
-            r"\.bashrc$", r"\.bash_profile$", r"\.bash_login$", r"\.bash_logout$",
-            r"\.zshrc$", r"\.zshenv$", r"\.zprofile$", r"\.zlogin$",
-            r"\.profile$", r"\.inputrc$",
-            r"(^|/)crontab$",
-            r"/var/spool/cron/",
-            r"\.config/systemd/user/",
-            r"\.config/autostart/",
-            r"(^|/)plugins/.*\.py$",
-            r"\.git/hooks/",
-            # Cloud / tool creds
-            r"\.aws/", r"\.azure/", r"\.gcloud/",
-            r"\.kube/config",
-            r"\.docker/config\.json",
-            r"\.netrc$", r"\.git-credentials$",
+            # filled in by _expand_shared_lists()
         ],
         "allow": [
             r"^" + str(Path.home()) + r"/",
             r"^/tmp/",
-        ]
+        ],
     },
     "glob_find": {
         "allow": [".*"]
@@ -254,24 +299,95 @@ DEFAULT_POLICIES = {
 }
 
 
+def _expand_shared_lists(policies: dict) -> dict:
+    """Move the underscore-prefixed shared lists into the real tool rules.
+
+    Keeps the source readable (one canonical _PERSISTENCE_DENY /
+    _CREDENTIAL_DENY / _HISTORY_DENY / _SYSTEM_DIRS_DENY) and removes the
+    copy-paste drift class that tripped up v1.0.5 — where write_file and
+    edit_file fell out of sync and one of them missed a cloud-cred deny
+    the other had.
+    """
+    persistence = policies.pop("_PERSISTENCE_DENY", [])
+    credential  = policies.pop("_CREDENTIAL_DENY", [])
+    history     = policies.pop("_HISTORY_DENY", [])
+    system_dirs = policies.pop("_SYSTEM_DIRS_DENY", [])
+
+    # Write paths: persistence + credentials (poisoning) + system dirs.
+    for tool in ("write_file", "edit_file"):
+        rules = policies.setdefault(tool, {"deny": [], "allow": [r".*"]})
+        rules["deny"] = list(system_dirs) + list(persistence) + list(credential) + list(rules.get("deny", []))
+
+    # Read paths: credentials + history. Persistence files are technically
+    # readable (they're config, not secrets) but some like crontab can
+    # expose scheduled-job secrets — credential list already covers the
+    # worst of it.
+    policies.setdefault("read_file", {"deny": [], "allow": [r".*"]})["deny"] = (
+        list(credential) + list(history) + list(policies["read_file"].get("deny", []))
+    )
+
+    # grep_search and list_dir must not become a read_file bypass: if
+    # read_file denies a credential, grep_search across the same path
+    # would still let the model enumerate its contents.
+    for tool in ("grep_search", "list_dir"):
+        rules = policies.setdefault(tool, {"deny": [], "allow": [r".*"]})
+        rules["deny"] = list(credential) + list(history) + list(rules.get("deny", []))
+
+    return policies
+
+
+DEFAULT_POLICIES = _expand_shared_lists(DEFAULT_POLICIES)
+
+
 class PolicyDecision:
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
 
 
+def _normalize_path(raw: str) -> str:
+    """Resolve path traversal, symlinks, and relative paths to an absolute
+    canonical form **before** policy evaluation.
+
+    Without this, both families of bypass work: ``/tmp/../etc/cron.d/evil``
+    starts with ``/tmp`` so ``^/etc/`` never matches, and a symlink
+    ``/tmp/safe → /etc/shadow`` lets the policy evaluate the benign
+    ``/tmp/safe`` while the OS dereferences to the sensitive target.
+
+    ``strict=False`` lets us normalise paths that don't exist yet (common
+    for ``write_file`` — we want to deny ``/tmp/../etc/x`` *before*
+    anything is created).
+    """
+    if not raw:
+        return ""
+    try:
+        expanded = os.path.expanduser(str(raw))
+        return str(Path(expanded).resolve(strict=False))
+    except (OSError, ValueError):
+        # Unresolvable input — return the raw string; downstream deny rules
+        # still see something to match against and the tool will likely
+        # fail later anyway.
+        return str(raw)
+
+
 def _get_check_value(tool_name: str, args: dict) -> str:
-    """Wyciągnij wartość do sprawdzenia z argumentów toola."""
+    """Wyciągnij wartość do sprawdzenia z argumentów toola. Path-based tools
+    go through _normalize_path so traversal and symlinks can't hide a
+    denied target behind a benign-looking prefix."""
     if tool_name == "bash":
-        return args.get("command", "")
+        # Strip NUL bytes before pattern matching; some regex backends
+        # stop scanning at a NUL and an attacker-crafted payload could
+        # hide a denied command after one. NUL isn't meaningful to bash
+        # anyway (it terminates argv strings at the syscall boundary).
+        return (args.get("command", "") or "").replace("\x00", "")
     elif tool_name in ("read_file", "write_file", "edit_file"):
-        return args.get("path", "")
+        return _normalize_path(args.get("path", ""))
     elif tool_name == "list_dir":
-        return args.get("path", "")
+        return _normalize_path(args.get("path", ""))
     elif tool_name == "glob_find":
-        return args.get("pattern", "") + " " + args.get("path", "")
+        return args.get("pattern", "") + " " + _normalize_path(args.get("path", ""))
     elif tool_name == "grep_search":
-        return args.get("path", "")
+        return _normalize_path(args.get("path", ""))
     return json.dumps(args)
 
 

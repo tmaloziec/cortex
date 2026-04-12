@@ -28,6 +28,27 @@ import uvicorn
 OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:26b")
 CS_URL       = os.getenv("CS_URL",       "")
+# Explicit CS_URL validation at import time. agent.py also validates on
+# its own import (web.py loads agent.py lower in the file), but rely on
+# that implicitly is fragile — so do it here too. Belt + suspenders.
+_agent_mod_path = Path(__file__).parent / "agent.py"
+if _agent_mod_path.exists():
+    import importlib.util as _iu
+    _sp = _iu.spec_from_file_location("_agent_validate", str(_agent_mod_path))
+    if _sp and _sp.loader:
+        _m = _iu.module_from_spec(_sp)
+        try:
+            _sp.loader.exec_module(_m)
+            if not _m.validate_cs_url(CS_URL):
+                print(f"REFUSING TO START: invalid CS_URL={CS_URL!r}", file=sys.stderr)
+                sys.exit(2)
+        except SystemExit:
+            raise
+        except Exception:
+            # agent.py itself will re-run the same check when loaded via
+            # the real code path below; don't fail the import here if
+            # the dry-run has an unrelated issue.
+            pass
 AGENT_NAME   = os.getenv("AGENT_NAME",   "cortex")
 THINK_MODE   = os.getenv("THINK_MODE",   "false").lower() == "true"
 WEB_PORT     = int(os.getenv("WEB_PORT", "8080"))
@@ -88,8 +109,17 @@ def _valid_tool_name(name) -> bool:
 
 # How long to wait for a user ASK-approval over the WebSocket before timing
 # out and treating the call as denied. Configurable; keep short enough that
-# a forgotten browser tab doesn't wedge the worker forever.
-TOOL_ASK_TIMEOUT = int(os.getenv("TOOL_ASK_TIMEOUT", "60"))
+# a forgotten browser tab doesn't wedge the worker forever. Clamped to a
+# sane range so a misconfigured env can't block the agent for an hour or
+# slip a negative value past asyncio.wait_for.
+TOOL_ASK_TIMEOUT = max(5, min(int(os.getenv("TOOL_ASK_TIMEOUT", "60")), 600))
+
+# Cap the number of simultaneously-open WebSocket sessions so a runaway
+# client (or a hostile LAN neighbour after the token) can't exhaust the
+# Python thread pool the tools run in. Configurable via env; default 10.
+MAX_WS_CONNECTIONS = max(1, int(os.getenv("MAX_WS_CONNECTIONS", "10")))
+_ws_active_connections = 0
+_ws_connection_lock = threading.Lock()
 
 # Locks per-session-id for atomic writes
 _SESSION_LOCKS: dict = {}
@@ -1433,7 +1463,10 @@ async def root():
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
-    # CSRF protection: validate Origin header (browsers always send it for WS)
+    # CSRF protection: validate Origin header. Browsers always send Origin
+    # for cross-origin WebSocket attempts, so a missing Origin is a signal
+    # of a non-browser client (CLI harness, tests) — let those through on
+    # the token alone. A *present but wrong* Origin is a clear CSRF, reject.
     origin = ws.headers.get("origin", "")
     if AUTH_TOKEN and origin and origin not in _ALLOWED_ORIGINS:
         await ws.close(code=4403)
@@ -1442,6 +1475,14 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     if not _check_auth(token):
         await ws.close(code=4401)
         return
+    # Cap concurrent sessions — see MAX_WS_CONNECTIONS comment above.
+    # `global` is declared once here; the finally block reuses the binding.
+    global _ws_active_connections  # noqa: PLW0603 — module-level counter
+    with _ws_connection_lock:
+        if _ws_active_connections >= MAX_WS_CONNECTIONS:
+            await ws.close(code=4429)  # 4429 = custom "too many connections"
+            return
+        _ws_active_connections += 1
     await ws.accept()
 
     briefing = get_briefing()
@@ -1753,6 +1794,10 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
         stop_event.set()
         reader_task.cancel()
         save_session_to_cs(session_id, messages)
+    finally:
+        # Release the connection slot even if save_session_to_cs throws.
+        with _ws_connection_lock:
+            _ws_active_connections = max(0, _ws_active_connections - 1)
 
 def _get_ram_gb() -> float:
     """Pobierz ilość dostępnego RAM w GB."""
@@ -1864,8 +1909,10 @@ async def delete_session(session_id: str, authorization: str = Header(default=No
 
 @app.get("/health")
 async def health():
-    """Public health check (no auth required)."""
-    return {"status": "ok", "model": OLLAMA_MODEL, "agent": AGENT_NAME, "auth_required": bool(AUTH_TOKEN)}
+    """Public health check (no auth required). Returns only a liveness
+    signal — model name, agent name, and auth state used to be returned
+    here too, but that leaked recon info to unauthenticated callers."""
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import webbrowser, threading
