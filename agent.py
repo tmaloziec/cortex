@@ -72,6 +72,28 @@ POLICY_FILE     = os.getenv("POLICY_FILE", "")  # optional custom policy.json
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 log = logging.getLogger("agent")
 
+
+def validate_cs_url(url: str) -> bool:
+    """CS_URL must be empty (feature off) or a real http(s) URL with a host.
+    Rejects file://, javascript:, and malformed strings so crafted env does
+    not turn a CS call into local file read or script URL scheme handling.
+    Shared by agent/worker/web so hardening is enforced everywhere."""
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+
+if not validate_cs_url(CS_URL):
+    # Fatal: refuse to start with a bogus CS_URL. This is shared config —
+    # worker.py/web.py inherit the guard by importing this module.
+    log.error("Invalid CS_URL=%r — must be empty or http(s)://host[:port]", CS_URL)
+    sys.exit(2)
+
 # ─── COLORS ────────────────────────────────────────────────────────────────────
 class C:
     RESET   = "\033[0m"
@@ -642,8 +664,16 @@ def call_ollama(messages: list, tools: list, stream_cb=None, thinking_cb=None) -
 
 
 def call_anthropic(messages: list, tools: list = None, **kwargs) -> dict:
-    """Fallback: Anthropic Claude API."""
-    import anthropic
+    """Fallback: Anthropic Claude API. Requires `pip install anthropic`;
+    not pinned in requirements.txt because the local Ollama path is the
+    primary one. Fails loudly so the operator knows to install the extra."""
+    try:
+        import anthropic
+    except ImportError as e:
+        raise RuntimeError(
+            "Anthropic fallback requested but the `anthropic` package is not "
+            "installed. Run `pip install anthropic` or unset ANTHROPIC_API_KEY."
+        ) from e
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     system_msg = next(
         (m["content"] for m in messages if m["role"] == "system"), ""

@@ -56,19 +56,8 @@ _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 def _valid_task_id(tid) -> bool:
     return isinstance(tid, str) and bool(_TASK_ID_RE.match(tid))
 
-def _validate_cs_url(url: str) -> bool:
-    """CS_URL must be http(s) with a host. Reject file://, javascript:, etc."""
-    if not url:
-        return True  # empty is allowed (CS features disabled)
-    try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
-
-if not _validate_cs_url(CS_URL):
-    log.error("Invalid CS_URL=%r — must be http(s)://host[:port]", CS_URL)
-    sys.exit(2)
+# CS_URL validity is enforced by agent.validate_cs_url at import time
+# (agent.py sys.exits if CS_URL is malformed). Nothing to duplicate here.
 
 running = True
 

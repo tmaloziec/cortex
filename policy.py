@@ -5,13 +5,80 @@ Wzorowane na Claude Code permission system (Allow/Deny/Ask).
 """
 
 import re
+import os
 import copy
 import json
+import shlex
 import logging
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# ─── BASH FILTER — IMPORTANT CAVEAT ──────────────────────────────────────────
+# The bash deny-list below is a BEST-EFFORT HEURISTIC, not a hard security
+# gate. Bash is Turing-complete; any determined attacker can trivially bypass
+# pattern matching using substitution ($(printf 'rm')), escapes (\rm), renamed
+# binaries (cp /bin/rm /tmp/x && /tmp/x …), indirect invocation (python -c,
+# eval), or by encoding the payload (base64 | sh). The argv-level check below
+# adds a second layer that catches the most common "oops, I typed rm -rf /"
+# and trivially obfuscated forms, but is not a substitute for deployment
+# hygiene: don't run Cortex as root, don't load untrusted plugins, don't
+# connect to models you can't trust. See SECURITY.md for the full threat
+# model and Policy Engine semantics.
+
+# argv[0] programs that trigger DENY when they appear as the literal first
+# token of a parsed command. Regex still runs in addition; this is belt-and-
+# suspenders.
+_ARGV0_DENY = {
+    # Filesystem / hardware destruction
+    "mkfs", "dd", "shred", "hdparm", "blkdiscard", "wipefs",
+    # System control (keep in sync with the regex above for consistency)
+    "shutdown", "reboot", "halt", "poweroff", "init",
+    # Scanners — require plugin opt-in
+    "nmap", "masscan", "nikto", "sqlmap", "thehoneyharvester", "theharvester",
+    "dirb", "gobuster", "hydra", "patator", "medusa",
+}
+
+def _argv0_check(cmd: str) -> Optional[str]:
+    """Parse *cmd* with shlex and apply argv-level denies.
+
+    Catches common cases regex misses — ``rm -rf -- /``, ``\\rm -rf /``,
+    whitespace padding — by looking at the actual program name and flags
+    after shell tokenization. Returns a reason string on deny, None otherwise.
+
+    Limitations (intentional, see module header):
+    * Does not expand ``$(…)`` or backticks — shlex parses them as one token.
+    * Does not recurse into ``bash -c "…"`` / ``python -c "…"``.
+    * Silently gives up on unparseable input (regex layer still runs).
+    """
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    prog = os.path.basename(tokens[0]).lower()
+    # Normalise obvious obfuscation: strip leading backslash (\rm → rm).
+    if prog.startswith("\\"):
+        prog = prog[1:]
+    if prog in _ARGV0_DENY:
+        return f"argv[0]='{prog}' is on the program denylist"
+    # Extra rule for rm: regex only catches "rm -rf /" in exact form; argv
+    # lets us notice ``rm -rf -- /`` and ``rm -rf /`` padded with flags. We
+    # deny rm whenever any positional argument is exactly ``/`` (or a top-
+    # level directory like ``/home``, ``/etc``). Regular file deletes are
+    # unaffected.
+    if prog == "rm":
+        args_tail = tokens[1:]
+        if "--" in args_tail:
+            args_tail = args_tail[args_tail.index("--") + 1:]
+        else:
+            args_tail = [a for a in args_tail if not a.startswith("-")]
+        for a in args_tail:
+            if a == "/" or re.fullmatch(r"/(bin|boot|etc|home|lib\w*|opt|root|sbin|srv|usr|var)/?", a):
+                return f"rm targets a top-level directory ({a!r})"
+    return None
 
 # ─── DEFAULT POLICIES ─────────────────────────────────────────────────────────
 # Ładowane jeśli brak policy.json
@@ -77,9 +144,27 @@ DEFAULT_POLICIES = {
             r"^/usr/",
             r"^/bin/",
             r"^/sbin/",
+            r"^/etc/",
             # credentials
             r"\.ssh/id_",
+            r"\.ssh/authorized_keys",
             r"\.gnupg/",
+            # Shell/session persistence — prompt injection + write_file would
+            # otherwise be a one-shot backdoor (reverse shell on next login).
+            r"\.bashrc$", r"\.bash_profile$", r"\.bash_login$", r"\.bash_logout$",
+            r"\.zshrc$", r"\.zshenv$", r"\.zprofile$", r"\.zlogin$",
+            r"\.profile$",
+            r"\.inputrc$",
+            # Cron and systemd user units — another persistence vector.
+            r"(^|/)crontab$",
+            r"/var/spool/cron/",
+            r"\.config/systemd/user/",
+            r"\.config/autostart/",
+            # Dropping code into Cortex's own plugin directory = auto-RCE on
+            # next startup (plugins/ is importlib-loaded at boot).
+            r"(^|/)plugins/.*\.py$",
+            # Other persistence-rich dotfiles.
+            r"\.git/hooks/",
         ],
         "ask": [],
         "allow": [
@@ -88,9 +173,28 @@ DEFAULT_POLICIES = {
     },
     "read_file": {
         "deny": [
+            # Traditional creds
             r"\.ssh/id_",
+            r"\.ssh/authorized_keys",
             r"\.gnupg/",
             r"shadow$",
+            # Dotenv / cloud / tool credentials — prompt injection could
+            # otherwise silently ship these to an external tool output.
+            r"\.env($|\.)",
+            r"\.aws/",
+            r"\.azure/",
+            r"\.gcloud/",
+            r"\.kube/config",
+            r"\.docker/config\.json",
+            r"\.npmrc$", r"\.pypirc$",
+            r"\.netrc$",
+            r"\.git-credentials$",
+            r"\.config/.*(token|credentials|secret|apikey|api_key)",
+            # Shell & language history — often contains typed passwords.
+            r"\.bash_history$", r"\.zsh_history$", r"\.python_history$",
+            r"\.lesshst$", r"\.mysql_history$", r"\.psql_history$",
+            # Other users' Cortex sessions.
+            r"\.cortex/sessions/",
         ],
         "allow": [".*"]
     },
@@ -114,8 +218,28 @@ DEFAULT_POLICIES = {
             r"^/etc/",
             r"^/boot/",
             r"^/usr/",
+            r"^/bin/",
+            r"^/sbin/",
             r"\.ssh/",
-            r"\.env$",
+            r"\.gnupg/",
+            r"\.env($|\.)",
+            # Persistence hooks — same list as write_file. Keeping both in
+            # sync matters; edit_file w/o these denies lets a reverse shell
+            # line be appended to an existing ~/.bashrc.
+            r"\.bashrc$", r"\.bash_profile$", r"\.bash_login$", r"\.bash_logout$",
+            r"\.zshrc$", r"\.zshenv$", r"\.zprofile$", r"\.zlogin$",
+            r"\.profile$", r"\.inputrc$",
+            r"(^|/)crontab$",
+            r"/var/spool/cron/",
+            r"\.config/systemd/user/",
+            r"\.config/autostart/",
+            r"(^|/)plugins/.*\.py$",
+            r"\.git/hooks/",
+            # Cloud / tool creds
+            r"\.aws/", r"\.azure/", r"\.gcloud/",
+            r"\.kube/config",
+            r"\.docker/config\.json",
+            r"\.netrc$", r"\.git-credentials$",
         ],
         "allow": [
             r"^" + str(Path.home()) + r"/",
@@ -189,6 +313,14 @@ class PolicyEngine:
             return PolicyDecision.ASK, f"Brak reguł dla tool: {tool_name}"
 
         value = _get_check_value(tool_name, args)
+
+        # Second bash layer: argv[0] denylist (heuristic, documented as such).
+        # Runs before the regex pass so the reason we surface to the user is
+        # precise ("argv[0]='rm' …") rather than a regex fragment.
+        if tool_name == "bash":
+            argv_reason = _argv0_check(value)
+            if argv_reason:
+                return PolicyDecision.DENY, argv_reason
 
         # deny first
         for pattern in rules.get("deny", []):

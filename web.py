@@ -78,6 +78,19 @@ class _TokenRedactFilter(logging.Filter):
 for _name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
     logging.getLogger(_name).addFilter(_TokenRedactFilter())
 
+# Tool names are model-produced; reject anything outside this shape before
+# logging, dispatching, or rendering in the UI. Prevents XSS via crafted
+# tool_calls[].function.name and keeps the WS protocol schema tight.
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+def _valid_tool_name(name) -> bool:
+    return isinstance(name, str) and bool(_TOOL_NAME_RE.match(name))
+
+# How long to wait for a user ASK-approval over the WebSocket before timing
+# out and treating the call as denied. Configurable; keep short enough that
+# a forgotten browser tab doesn't wedge the worker forever.
+TOOL_ASK_TIMEOUT = int(os.getenv("TOOL_ASK_TIMEOUT", "60"))
+
 # Locks per-session-id for atomic writes
 _SESSION_LOCKS: dict = {}
 _SESSION_LOCKS_LOCK = threading.Lock()
@@ -109,6 +122,37 @@ def _require_auth(authorization: str = None, x_token: str = None, query_token: s
         raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 app = FastAPI(title="Cortex")
+
+# ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
+# Single-file UI: styles and the whole agent script live inline in the HTML.
+# That forces 'unsafe-inline' for style/script — CSP is still worthwhile
+# because it constrains what inline code may *talk to*: connect-src is
+# same-origin only so even if stored HTML smuggled a script through some
+# future regression, it can't ship tokens to evil.com. Fonts stay on Google
+# with a narrow exception; Referrer-Policy kills the bootstrap-URL leak
+# via the Referer header. Headers also apply to /api/* responses.
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+@app.middleware("http")
+async def _add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("Content-Security-Policy", _CSP)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=()")
+    return response
 
 # ─── SESSION STORAGE ──────────────────────────────────────────────────────────
 SESSIONS_DIR = Path.home() / ".cortex" / "sessions"
@@ -195,6 +239,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="referrer" content="no-referrer">
 <title>Cortex — Local AI Agent</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;400;500;600&display=swap');
@@ -575,6 +620,27 @@ HTML = r"""<!DOCTYPE html>
   .tool-call .tool-arg  { color: var(--muted); }
   .tool-call .tool-result { color: var(--green); margin-top: 4px; white-space: pre-wrap; }
 
+  /* ─── TOOL ASK (user confirmation) ─── */
+  .tool-ask {
+    border-left-color: var(--red);
+    color: var(--text);
+  }
+  .tool-ask .ask-head { color: var(--red); font-weight: 600; margin-bottom: 4px; }
+  .tool-ask .ask-timer { color: var(--muted); margin-left: 8px; font-weight: 400; }
+  .tool-ask .ask-arg code { background: var(--bg3); padding: 2px 6px; border-radius: 3px; color: var(--text); }
+  .tool-ask .ask-reason { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
+  .tool-ask .ask-actions button {
+    background: var(--bg3); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 14px; margin-right: 6px; cursor: pointer;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  }
+  .tool-ask .ask-actions .ask-allow { border-color: var(--green); color: var(--green); }
+  .tool-ask .ask-actions .ask-deny  { border-color: var(--red);   color: var(--red); }
+  .tool-ask .ask-actions button:disabled { opacity: 0.5; cursor: default; }
+  .tool-ask.ask-allowed { border-left-color: var(--green); }
+  .tool-ask.ask-denied  { border-left-color: var(--dim); opacity: 0.6; }
+
   /* ─── THINKING BLOCK ─── */
   .thinking-block {
     background: var(--bg3);
@@ -873,8 +939,13 @@ function handleServerMsg(msg) {
   else if (msg.type === 'tool_call') {
     const div = document.createElement('div');
     div.className = 'tool-call';
-    div.innerHTML = `<span class="tool-name">▶ ${msg.name}</span> <span class="tool-arg">${escHtml(msg.arg || '')}</span>`;
-    div.id = `tc-${msg.id}`;
+    // msg.name comes from model-produced tool_calls[].function.name; escape.
+    // msg.id is generated server-side but treat it defensively too — it
+    // ends up both in the element id and in document.getElementById later.
+    const safeName = escHtml(msg.name || '');
+    const safeId   = String(msg.id || '').replace(/[^A-Za-z0-9_-]/g, '');
+    div.innerHTML = `<span class="tool-name">▶ ${safeName}</span> <span class="tool-arg">${escHtml(msg.arg || '')}</span>`;
+    div.id = `tc-${safeId}`;
     if (currentAgentBubble) {
       currentAgentBubble.parentElement.after(div);
     } else {
@@ -884,13 +955,65 @@ function handleServerMsg(msg) {
   }
 
   else if (msg.type === 'tool_result') {
-    const tcDiv = document.getElementById(`tc-${msg.id}`);
+    const safeId = String(msg.id || '').replace(/[^A-Za-z0-9_-]/g, '');
+    const tcDiv = document.getElementById(`tc-${safeId}`);
     if (tcDiv) {
       const res = document.createElement('div');
       res.className = 'tool-result';
       res.textContent = '→ ' + (msg.result || '').slice(0, 200);
       tcDiv.appendChild(res);
     }
+  }
+
+  else if (msg.type === 'tool_ask') {
+    // Server wants user confirmation before running this tool. Render an
+    // in-chat prompt with Allow/Deny and report the result back. Timing out
+    // on the server side is treated as Deny, so we don't have to race here.
+    const safeId   = String(msg.id || '').replace(/[^A-Za-z0-9_-]/g, '');
+    const safeName = escHtml(msg.name || '');
+    const safeArg  = escHtml(msg.arg || '');
+    const safeReason = escHtml(msg.reason || '');
+    const timeoutSec = parseInt(msg.timeout, 10) || 60;
+    const div = document.createElement('div');
+    div.className = 'tool-call tool-ask';
+    div.id = `ask-${safeId}`;
+    div.innerHTML = `
+      <div class="ask-head">? <strong>${safeName}</strong> wymaga zgody <span class="ask-timer">${timeoutSec}s</span></div>
+      <div class="ask-arg"><code>${safeArg}</code></div>
+      <div class="ask-reason">${safeReason}</div>
+      <div class="ask-actions">
+        <button class="ask-allow">Allow</button>
+        <button class="ask-deny">Deny</button>
+      </div>`;
+    if (currentAgentBubble) {
+      currentAgentBubble.parentElement.after(div);
+    } else {
+      messagesEl.appendChild(div);
+    }
+    scrollBottom();
+    const respond = (allow) => {
+      if (div.dataset.answered === '1') return;
+      div.dataset.answered = '1';
+      try {
+        ws.send(JSON.stringify({ type: 'tool_ask_response', id: safeId, allow }));
+      } catch (e) {}
+      div.querySelectorAll('button').forEach(b => b.disabled = true);
+      div.classList.add(allow ? 'ask-allowed' : 'ask-denied');
+    };
+    div.querySelector('.ask-allow').addEventListener('click', () => respond(true));
+    div.querySelector('.ask-deny').addEventListener('click', () => respond(false));
+    // Visual countdown; server enforces the actual timeout.
+    const timerEl = div.querySelector('.ask-timer');
+    let remaining = timeoutSec;
+    const iv = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0 || div.dataset.answered === '1') {
+        clearInterval(iv);
+        if (div.dataset.answered !== '1') respond(false);
+        return;
+      }
+      timerEl.textContent = remaining + 's';
+    }, 1000);
   }
 
   else if (msg.type === 'done') {
@@ -1093,27 +1216,63 @@ function insertCmd(text) {
 }
 
 function escHtml(str) {
-  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Full HTML escape — covers text content AND attribute-context uses.
+  // Quote characters matter when the output is ever interpolated inside an
+  // HTML attribute value. We don't escape backticks: renderContent's
+  // markdown regex relies on literal ``` after escaping to detect code
+  // fences, and backticks aren't HTML-special anyway.
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
 }
 
 let currentSessionId = null;
 
+// Version marker: if the HTML schema changes (escaping rules, element
+// structure, CSP context), bump this so we discard stored innerHTML from
+// an older Cortex. Before versioning, saved HTML from pre-v1.0.5 could
+// contain un-escaped model output from earlier renderContent behavior.
+const CORTEX_STORAGE_VERSION = '1.0.5';
+
 // ─── SESSION MANAGEMENT ───
 function saveToLocalStorage() {
   if (!currentSessionId) return;
-  const msgs = document.getElementById('messages').innerHTML;
-  localStorage.setItem('cortex_session_id', currentSessionId);
-  localStorage.setItem('cortex_session_html', msgs);
+  try {
+    localStorage.setItem('cortex_storage_version', CORTEX_STORAGE_VERSION);
+    localStorage.setItem('cortex_session_id', currentSessionId);
+    // We still persist innerHTML for fast restore, but the restore path
+    // gates on the version marker so older, possibly-unescaped snapshots
+    // never make it back into the DOM.
+    localStorage.setItem('cortex_session_html',
+      document.getElementById('messages').innerHTML);
+  } catch (e) {
+    // Quota or private-mode — non-fatal.
+  }
 }
 
 function restoreFromLocalStorage() {
-  const savedId = localStorage.getItem('cortex_session_id');
+  const savedVer  = localStorage.getItem('cortex_storage_version');
+  const savedId   = localStorage.getItem('cortex_session_id');
   const savedHtml = localStorage.getItem('cortex_session_html');
+  if (savedVer !== CORTEX_STORAGE_VERSION) {
+    // Stale data from a pre-v1.0.5 Cortex. Drop it instead of injecting
+    // possibly-unescaped content back into the DOM. The server still has
+    // the session on disk, so load_session will repopulate safely.
+    localStorage.removeItem('cortex_storage_version');
+    localStorage.removeItem('cortex_session_id');
+    localStorage.removeItem('cortex_session_html');
+    if (savedId && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'load_session', session_id: savedId }));
+    }
+    return false;
+  }
   if (savedId && savedHtml) {
     currentSessionId = savedId;
     document.getElementById('messages').innerHTML = savedHtml;
     scrollBottom();
-    // reconnect do tej samej sesji
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'load_session', session_id: savedId }));
     }
@@ -1302,17 +1461,34 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
 
     # kolejka na przychodzące wiadomości WebSocket
     ws_queue = asyncio.Queue()
+    # Pending ASK prompts waiting on user approval, keyed by tc_id → Future.
+    ask_waiters: dict[str, asyncio.Future] = {}
 
     async def _ws_reader():
         """Czytaj wiadomości z WebSocket w tle."""
         try:
             while True:
                 data = await ws.receive_json()
-                if data.get("type") == "stop":
+                t = data.get("type")
+                if t == "stop":
                     stop_event.set()
+                elif t == "tool_ask_response":
+                    # Decouple ASK approvals from the main conversation queue:
+                    # if the user confirms a tool while the agent is mid-loop,
+                    # we need to resolve the pending Future, not re-queue.
+                    tc_id = data.get("id", "")
+                    fut = ask_waiters.pop(tc_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(bool(data.get("allow", False)))
                 else:
                     await ws_queue.put(data)
         except WebSocketDisconnect:
+            # Cancel any outstanding ASK waiters so the main loop doesn't
+            # hang waiting for a user who has left the page.
+            for fut in ask_waiters.values():
+                if not fut.done():
+                    fut.set_result(False)
+            ask_waiters.clear()
             await ws_queue.put(None)
 
     reader_task = asyncio.create_task(_ws_reader())
@@ -1495,6 +1671,23 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                     tc_id = f"{session_id}_{loop_count}_{i}"
                     arg_preview = args.get("command") or args.get("path") or args.get("content","")[:40] or ""
 
+                    # Reject obviously-malformed tool names before policy check.
+                    # Model can emit anything into function.name; an invalid
+                    # name has no valid execution anyway.
+                    if not _valid_tool_name(name):
+                        await ws.send_json({
+                            "type": "tool_call",
+                            "name": "[INVALID]",
+                            "arg": f"rejected tool name: {str(name)[:80]}",
+                            "id": tc_id,
+                        })
+                        tool_results.append({
+                            "role": "tool",
+                            "content": f"[ZABLOKOWANE] Invalid tool name",
+                            "name": "invalid",
+                        })
+                        continue
+
                     # Policy check
                     decision, reason = _policy.check(name, args)
                     if decision == PolicyDecision.DENY:
@@ -1503,7 +1696,40 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                         continue
 
                     if decision == PolicyDecision.ASK:
-                        await ws.send_json({"type": "tool_call", "name": f"[ASK→OK] {name}", "arg": f"{arg_preview} ({reason})", "id": tc_id})
+                        # Real user confirmation over the WebSocket — the old
+                        # behaviour here was silent auto-approval (`[ASK→OK]`),
+                        # which defeated the Policy Engine in web mode.
+                        loop = asyncio.get_event_loop()
+                        fut: asyncio.Future = loop.create_future()
+                        ask_waiters[tc_id] = fut
+                        await ws.send_json({
+                            "type": "tool_ask",
+                            "id": tc_id,
+                            "name": name,
+                            "arg": arg_preview,
+                            "reason": reason,
+                            "timeout": TOOL_ASK_TIMEOUT,
+                        })
+                        try:
+                            allow = await asyncio.wait_for(fut, timeout=TOOL_ASK_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            allow = False
+                            ask_waiters.pop(tc_id, None)
+                        if not allow:
+                            await ws.send_json({
+                                "type": "tool_call",
+                                "name": f"[DENIED-BY-USER] {name}",
+                                "arg": arg_preview,
+                                "id": tc_id,
+                            })
+                            tool_results.append({
+                                "role": "tool",
+                                "content": f"[ZABLOKOWANE przez użytkownika] {name}",
+                                "name": name,
+                            })
+                            continue
+                        # fall through — user approved, render normal tool_call
+                        await ws.send_json({"type": "tool_call", "name": name, "arg": arg_preview, "id": tc_id})
                     else:
                         await ws.send_json({"type": "tool_call", "name": name, "arg": arg_preview, "id": tc_id})
 
