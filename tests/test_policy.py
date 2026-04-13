@@ -848,6 +848,55 @@ def test_client_ip_uses_xrealip_not_leftmost_xff():
     os.environ.pop("CORTEX_TRUST_PROXY_HEADERS", None)
 
 
+# ─── R12/#1 True-Client-IP honoured (CF Enterprise) ──────────────────────
+def test_client_ip_honours_true_client_ip():
+    import sys as _sys, importlib
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        print("  SKIP (fastapi not installed)")
+        return
+    os.environ["WEB_TOKEN"] = "r12-token"
+    os.environ["CORTEX_TRUST_PROXY_HEADERS"] = "1"
+    if "web" in _sys.modules:
+        del _sys.modules["web"]
+    web = importlib.import_module("web")
+
+    class _FakeClient:
+        host = "10.0.0.1"
+    class _FakeReq:
+        client = _FakeClient()
+        headers = {
+            # CF Enterprise — True-Client-IP is the real client,
+            # CF-Connecting-IP may be absent on Enterprise plans.
+            "true-client-ip": "198.51.100.55",
+        }
+    assert web._client_ip(_FakeReq()) == "198.51.100.55"
+    os.environ.pop("CORTEX_TRUST_PROXY_HEADERS", None)
+
+
+# ─── R12/#3 IPv6 zone id stripped before bucketing ───────────────────────
+def test_rate_limit_key_strips_ipv6_zone():
+    import sys as _sys, importlib
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        print("  SKIP (fastapi not installed)")
+        return
+    if "web" in _sys.modules:
+        del _sys.modules["web"]
+    os.environ["WEB_TOKEN"] = "r12-token-b"
+    web = importlib.import_module("web")
+    k_base = web._rate_limit_key("fe80::1")
+    for zone in ("eth0", "wlan0", "br-docker0"):
+        k = web._rate_limit_key(f"fe80::1%{zone}")
+        assert k == k_base, (
+            f"rotating zone id produced different bucket: {k!r} vs {k_base!r}"
+        )
+
+
 # ─── Positive cases (regression: we didn't over-block) ───────────────────
 def test_legitimate_paths_still_allowed():
     p = PolicyEngine()

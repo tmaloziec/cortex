@@ -173,8 +173,22 @@ _SESSION_TTL_SEC = 60 * 60 * 8    # 8h — matches cookie max_age
 _SESSION_LIMIT   = 64             # hard cap on live sessions per process
 # R10: session record is {"expiry": monotonic_float, "hits": [float, ...]}
 # so the per-session rate-limit counter lives alongside expiry.
+#
+# R12/#4: single global lock became a contention point above ~50
+# concurrent sessions (each authenticated request takes it for the hit
+# counter). Shard by hash(sid) into _SESSIONS_SHARDS buckets so
+# unrelated sessions don't wait on each other. The global dict stays
+# as one structure (iteration for GC / eviction still needs a whole-
+# dict view under the primary lock) but hit-counter updates on a known
+# sid take only the shard lock. 8 shards is comfortably above the
+# 64-session cap and below the point where dict overhead dominates.
+_SESSIONS_SHARDS = 8
 _sessions: dict[str, dict] = {}
-_sessions_lock = threading.Lock()
+_sessions_lock = threading.Lock()  # kept for iteration / eviction
+_sessions_shard_locks = [threading.Lock() for _ in range(_SESSIONS_SHARDS)]
+
+def _shard_lock(sid: str) -> threading.Lock:
+    return _sessions_shard_locks[hash(sid) % _SESSIONS_SHARDS]
 
 # R10/#2: soft per-session throttle on authenticated traffic. A stolen
 # 8h cookie used to mean unlimited API — this caps a single session to
@@ -187,12 +201,16 @@ _SESSION_RATE_WINDOW = 60.0
 
 def _note_session_hit(sid: str) -> bool:
     """Record one authenticated request on *sid*; return True when the
-    session is over the rate budget for the current window."""
+    session is over the rate budget for the current window.
+
+    R12/#4: holds only the per-sid shard lock, not the global sessions
+    lock. Unrelated sessions on different shards proceed in parallel.
+    """
     if not sid:
         return False
     import time as _time
     now = _time.monotonic()
-    with _sessions_lock:
+    with _shard_lock(sid):
         rec = _sessions.get(sid)
         if rec is None or not isinstance(rec, dict):
             return False
@@ -265,6 +283,12 @@ def _rate_limit_key(ip: str) -> str:
     """
     if not ip:
         return ""
+    # R12/#3: strip IPv6 zone IDs (fe80::1%eth0) before parsing.
+    # ip_address() raises ValueError on the zone form, so the previous
+    # except-fallback returned the full string including the zone — a
+    # LAN attacker rotating %zone values got a fresh bucket each time.
+    if "%" in ip:
+        ip = ip.split("%", 1)[0]
     if ":" in ip:
         # IPv6 — collapse to /64 (first 4 hextets). `::ffff:1.2.3.4` form
         # (IPv4-mapped) will fall through and get bucketed as ipv4.
@@ -328,7 +352,11 @@ def _client_ip(request_or_ws) -> str:
         if TRUST_PROXY_HEADERS and hasattr(request_or_ws, "headers"):
             # Single-value overwritten headers — trusted when the
             # operator has opted into proxy-header trust.
-            for _h in ("cf-connecting-ip", "x-real-ip"):
+            # R12/#1: True-Client-IP added. CF Enterprise emits this
+            # header, not CF-Connecting-IP; without it Enterprise
+            # traffic fell through to the TCP peer (CF edge IP) and
+            # bucketed all users into one bucket → rate-limit bypass.
+            for _h in ("true-client-ip", "cf-connecting-ip", "x-real-ip"):
                 v = request_or_ws.headers.get(_h, "").strip()
                 if v:
                     return v
@@ -1827,13 +1855,18 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
 
     reader_task = asyncio.create_task(_ws_reader())
 
-    # R11/M4: capture the cookie token (if any) we authed with so the
-    # main loop can periodically re-check it. A WS opened with a valid
-    # cookie previously stayed authenticated until disconnect — so a
-    # cookie stolen, replayed once to open a socket, and then kept
-    # alive would survive both expiry and /api/logout. We now re-verify
-    # on every inbound message.
-    ws_auth_cookie = cookie_token  # may be empty for CLI clients on ?token=
+    # R11/M4 + R12/#2: capture whichever credential authed this socket
+    # so the main loop re-verifies it per inbound message. Covers:
+    #   (a) browser cookie path — revoked/expired sessions drop within
+    #       one turn of /api/logout or TTL crossing;
+    #   (b) CLI ?token= path — previously exempt from re-auth. An
+    #       operator who rotates WEB_TOKEN (recovery playbook: leak →
+    #       restart with new token) used to leave old CLI sockets alive
+    #       indefinitely. `ws_auth_token` captures the master token
+    #       used at handshake so a later AUTH_TOKEN rotation drops the
+    #       socket on the next message.
+    ws_auth_cookie = cookie_token
+    ws_auth_token  = token if not cookie_token else ""
 
     try:
         while True:
@@ -1841,16 +1874,22 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
             if data is None:
                 break
 
-            # R11/M4: re-check the session cookie on every inbound
-            # message so a stolen cookie that has been revoked (or
-            # expired) stops working within seconds of the next user
-            # turn. CLI clients that authed via ?token= have no cookie
-            # to re-check; they keep the per-handshake authentication
-            # (still bounded by MAX_WS_CONNECTIONS + stop button).
-            if ws_auth_cookie and AUTH_TOKEN and not _check_session_cookie(ws_auth_cookie):
-                await ws.send_json({"type": "error", "content": "Session expired"})
-                await ws.close(code=4401)
-                break
+            # R11/M4 + R12/#2: re-check the authenticating credential
+            # on every inbound message. Cookie path drops within one
+            # turn of revoke/expiry; master-token path drops within
+            # one turn of AUTH_TOKEN rotation (previously CLI sockets
+            # were immune).
+            if AUTH_TOKEN:
+                if ws_auth_cookie:
+                    ok = _check_session_cookie(ws_auth_cookie)
+                elif ws_auth_token:
+                    ok = _check_auth(ws_auth_token)
+                else:
+                    ok = False
+                if not ok:
+                    await ws.send_json({"type": "error", "content": "Session expired"})
+                    await ws.close(code=4401)
+                    break
 
             if data.get("type") == "clear":
                 messages = [{"role": "system", "content": build_system_prompt(get_briefing())}]

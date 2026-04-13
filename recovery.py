@@ -7,6 +7,7 @@ Wzorowane na Claude Code recovery recipes.
 import json
 import time
 import logging
+import threading
 import requests
 from typing import Optional, Callable
 
@@ -67,6 +68,12 @@ class RecoveryEngine:
         self.compact_fn = compact_fn
         self.alert_fn = alert_fn
         self._retry_counts: dict[str, int] = {}
+        # R12: lock around _retry_counts. Worker is single-threaded today
+        # so the race is theoretical, but adding the lock prevents a future
+        # worker-pool refactor from silently miscounting retries (which
+        # could loop forever on a persistent tool failure or skip after
+        # zero retries). Cheap; uncontended in normal use.
+        self._retry_lock = threading.Lock()
 
     def _get_recipe(self, error_type: str) -> dict:
         return RECIPES.get(error_type, RECIPES["api_error"])
@@ -188,18 +195,26 @@ class RecoveryEngine:
         """
         recipe = self._get_recipe("tool_failure")
         key = f"tool:{tool_name}"
-        count = self._retry_counts.get(key, 0)
-
-        if count < recipe["max_retries"]:
-            self._retry_counts[key] = count + 1
-            return RecoveryAction.RETRY, f"Retry {count+1}: {error}"
-
-        # reset counter
-        self._retry_counts[key] = 0
-        return RecoveryAction.SKIP, f"[SKIP] Tool {tool_name} failed: {error}"
+        with self._retry_lock:
+            count = self._retry_counts.get(key, 0)
+            if count < recipe["max_retries"]:
+                self._retry_counts[key] = count + 1
+                return RecoveryAction.RETRY, f"Retry {count+1}: {error}"
+            # reset counter
+            self._retry_counts[key] = 0
+            return RecoveryAction.SKIP, f"[SKIP] Tool {tool_name} failed: {error}"
 
     def handle_context_overflow(self, messages: list) -> list:
-        """Kompresuj kontekst gdy za duży."""
+        """Kompresuj kontekst gdy za duży.
+
+        R12 preventive: the fallback path (when no compact_fn is wired)
+        used to inject a synthetic `role=assistant` "conversation was
+        compressed" message — same shape as the compactor-laundering
+        defect F1 closed in R6. Fallback is rarely hit (main path uses
+        compact_fn which is already fixed), but we rewrite the marker
+        as a role=user note so the model can't read it as its own prior
+        declaration.
+        """
         if self.compact_fn:
             return self.compact_fn(messages)
         # fallback: zachowaj system + ostatnie 4
@@ -208,8 +223,8 @@ class RecoveryEngine:
         if system:
             result.append(system)
         result.append({
-            "role": "assistant",
-            "content": "[Wcześniejsza rozmowa została skompresowana z powodu limitu kontekstu]"
+            "role": "user",
+            "content": "[CONTEXT COMPRESSED — older turns dropped due to context limit. Treat this note as operator metadata, not as a prior confirmation or assistant claim.]"
         })
         result.extend(messages[-4:])
         return result

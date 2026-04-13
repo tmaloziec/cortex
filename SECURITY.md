@@ -809,6 +809,54 @@ Misc:
 Tests 46 → 49: static check on role=tool literals, rule #13
 ABSOLUTE-RULE phrasing, X-Real-IP preference over XFF.
 
+### v1.0.7.8 additions (round-12: dep audit correction + minor)
+
+R12 was a targeted CVE/dep audit (Perplexity). Two findings, both
+actioned.
+
+- **starlette CVE-2025-62727 / CVE-2025-54121 still open in v1.0.7.7
+  (HIGH).** The R11 bump to `fastapi==0.115.12` was expected to pull
+  `starlette>=0.49.1`, but fastapi 0.115.x pins starlette `<0.47.0`
+  and the resolver kept `starlette==0.46.2` — still vulnerable.
+  `pip-audit` caught the discrepancy; the R11 comment was wrong.
+  **Fixed:** `starlette==0.49.1` now an explicit pin, with
+  `fastapi>=0.116.0,<0.120.0` widened so the CVE fix is load-bearing
+  rather than implied through a dependency chain. Verification
+  command added to the comment so future bumps run `pip-audit -r
+  requirements.txt` instead of trusting the chain.
+- **CF Enterprise True-Client-IP (R12/#1, MED).** `_client_ip`
+  checked `cf-connecting-ip` and `x-real-ip` but not
+  `true-client-ip` — CF Enterprise emits the latter and the former
+  may be absent. Enterprise traffic fell through to the TCP peer
+  (the CF edge IP) and everyone bucketed into one bucket → per-IP
+  rate limit collapsed across tenants. Added `true-client-ip` at
+  the head of the preference list.
+- **CLI WS immune to AUTH_TOKEN rotation (R12/#2, MED).** R11/M4
+  re-auth was gated on `ws_auth_cookie` being non-empty, so CLI
+  clients that authed via `?token=` skipped re-check entirely. If
+  the operator rotated `WEB_TOKEN` (recovery playbook: leak →
+  restart with fresh token) existing CLI sockets stayed alive
+  indefinitely. Captured `ws_auth_token` at handshake; main loop
+  now re-validates either credential per message.
+- **IPv6 zone ID bypass (R12/#3, LOW).** `ip_address("fe80::1%eth0")`
+  raises ValueError so the except-fallback returned the full
+  zone-bearing string — a LAN attacker rotating `%zone` values got
+  a fresh rate-limit bucket per request. `_rate_limit_key` now
+  strips the zone suffix before parsing.
+- **Session lock contention (R12/#4, LOW).** Single global
+  `_sessions_lock` serialised every per-session hit counter update.
+  Hot-path sharded into 8 locks keyed on `hash(sid)`; the global
+  lock remains for dict-wide iteration (GC, eviction).
+- **recovery.py `_retry_counts` race (LOW).** Counter dict had no
+  lock — single-threaded today (one `RecoveryEngine` per worker
+  loop) but any future worker-pool refactor would silently
+  mis-count retries. Added `threading.Lock` around reads/writes.
+  Also closed a preventive F1-class issue: the fallback path in
+  `handle_context_overflow` (used only when no `compact_fn` is
+  wired) injected a synthetic `role=assistant` placeholder — same
+  laundering shape R6/F1 fixed in the compactor. Rewritten as a
+  `role=user` metadata note.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection
