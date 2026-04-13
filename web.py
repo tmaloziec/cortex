@@ -20,8 +20,8 @@ import subprocess
 import asyncio
 from pathlib import Path
 from urllib.parse import urlparse
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Query, Cookie, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 import uvicorn
 
 # ─── CONFIG (shared z agent.py) ────────────────────────────────────────────────
@@ -117,7 +117,10 @@ TOOL_ASK_TIMEOUT = max(5, min(int(os.getenv("TOOL_ASK_TIMEOUT", "60")), 600))
 # Cap the number of simultaneously-open WebSocket sessions so a runaway
 # client (or a hostile LAN neighbour after the token) can't exhaust the
 # Python thread pool the tools run in. Configurable via env; default 10.
-MAX_WS_CONNECTIONS = max(1, int(os.getenv("MAX_WS_CONNECTIONS", "10")))
+# Clamp both ends: a typo like MAX_WS_CONNECTIONS=100000 would uncap the
+# counter and blow up RAM (each session carries a full message list). 1000
+# is already far beyond any local-agent use case (audit R4 LOW).
+MAX_WS_CONNECTIONS = max(1, min(int(os.getenv("MAX_WS_CONNECTIONS", "10")), 1000))
 _ws_active_connections = 0
 _ws_connection_lock = threading.Lock()
 
@@ -139,10 +142,21 @@ def _check_auth(token: str) -> bool:
         return False
     return secrets.compare_digest(token, AUTH_TOKEN)
 
-def _require_auth(authorization: str = None, x_token: str = None, query_token: str = None):
-    """Extract token from Authorization header, X-Token header, or ?token= query."""
+# Name of the HttpOnly session cookie set after a successful bootstrap GET /
+# with ?token=. Separate from AUTH_TOKEN so future refactors (JWT/CS-backed
+# cookies, rotation) can change one without touching the other.
+AUTH_COOKIE_NAME = "cortex_session"
+
+def _require_auth(authorization: str = None, x_token: str = None,
+                  query_token: str = None, cookie_token: str = None):
+    """Extract token from cookie, Authorization header, X-Token header, or
+    ?token= query (in that order). Cookie is preferred so the bootstrap URL
+    token can be exchanged for an HttpOnly cookie after first load — red team
+    #6 flagged long-lived ?token= in Referer / browser history / shared URLs."""
     token = ""
-    if authorization and authorization.startswith("Bearer "):
+    if cookie_token:
+        token = cookie_token
+    elif authorization and authorization.startswith("Bearer "):
         token = authorization[7:]
     elif x_token:
         token = x_token
@@ -869,34 +883,23 @@ let currentAgentContent = "";
 let currentThinkingBlock = null;
 let currentThinkingContent = "";
 
-// ── Auth token: extract from URL ?token=... on first load, then store in sessionStorage
-(function initAuthToken() {
-  const params = new URLSearchParams(location.search);
-  const tokenFromUrl = params.get('token');
-  if (tokenFromUrl) {
-    sessionStorage.setItem('cortex_token', tokenFromUrl);
-    // Strip token from URL to avoid leaking via Referer / browser history
-    params.delete('token');
-    const newSearch = params.toString();
-    history.replaceState({}, '', location.pathname + (newSearch ? '?' + newSearch : ''));
-  }
-})();
-
-function getToken() {
-  return sessionStorage.getItem('cortex_token') || '';
-}
+// ── Auth: the bootstrap GET /?token=... exchanges the URL token for an
+// HttpOnly cookie on the server and redirects to a clean "/". From here on,
+// the browser attaches the cookie automatically to /api/* and /ws requests,
+// so the page never needs to read or store the token in JS. This closes
+// red team #6 (token in Referer / browser history / screen shares).
 
 async function apiFetch(url, opts = {}) {
   opts.headers = opts.headers || {};
-  const t = getToken();
-  if (t) opts.headers['X-Token'] = t;
+  opts.credentials = 'same-origin';  // send the HttpOnly cortex_session cookie
   return fetch(url, opts);
 }
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const t = getToken();
-  const wsUrl = `${proto}//${location.host}/ws` + (t ? `?token=${encodeURIComponent(t)}` : '');
+  // Same-origin handshake — the browser attaches cortex_session cookie
+  // to the upgrade request automatically. No ?token= in URLs anywhere.
+  const wsUrl = `${proto}//${location.host}/ws`;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
@@ -1458,8 +1461,34 @@ _recovery = RecoveryEngine(
 )
 
 @app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTML
+async def root(request: Request,
+               token: str = Query(default=""),
+               cortex_session: str = Cookie(default="")):
+    # Auth disabled? Serve HTML straight. Covers localhost + WEB_INSECURE=1.
+    if not AUTH_TOKEN:
+        return HTMLResponse(HTML)
+    # Cookie already carries a valid session — no token exchange needed.
+    if cortex_session and _check_auth(cortex_session):
+        return HTMLResponse(HTML)
+    # Bootstrap flow: first load with ?token=... from the terminal link.
+    # Validate, set HttpOnly cookie, and redirect to a clean "/" so the URL
+    # in the address bar / browser history / Referer header no longer
+    # carries the long-lived token (red team #6).
+    if token and _check_auth(token):
+        is_https = request.url.scheme == "https"
+        resp = RedirectResponse(url="/", status_code=303)
+        resp.set_cookie(
+            key=AUTH_COOKIE_NAME,
+            value=token,
+            httponly=True,            # JS can't read it — XSS can't exfil
+            secure=is_https,          # only over TLS when TLS is in play
+            samesite="strict",        # CSRF: no cross-site submissions
+            max_age=60 * 60 * 8,      # 8h working session; re-bootstrap after
+            path="/",
+        )
+        return resp
+    # No valid token anywhere — refuse with 401 rather than leaking the HTML.
+    raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
@@ -1471,8 +1500,12 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     if AUTH_TOKEN and origin and origin not in _ALLOWED_ORIGINS:
         await ws.close(code=4403)
         return
-    # Auth: token via ?token= query param (WebSockets can't use Authorization header reliably)
-    if not _check_auth(token):
+    # Auth: prefer HttpOnly cookie (browsers attach it automatically to the
+    # WS handshake same-origin), fall back to ?token= for CLI clients and
+    # the first-ever connection before the bootstrap redirect has run.
+    cookie_token = ws.cookies.get(AUTH_COOKIE_NAME, "") if hasattr(ws, "cookies") else ""
+    auth_value = cookie_token or token
+    if not _check_auth(auth_value):
         await ws.close(code=4401)
         return
     # Cap concurrent sessions — see MAX_WS_CONNECTIONS comment above.
@@ -1483,7 +1516,16 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
             await ws.close(code=4429)  # 4429 = custom "too many connections"
             return
         _ws_active_connections += 1
-    await ws.accept()
+    # If ws.accept() raises (peer hung up, handshake rejected), we must
+    # release the slot we just reserved — otherwise the counter drifts up
+    # permanently and eventually MAX_WS_CONNECTIONS locks everyone out.
+    # The main try/finally below only guards the post-accept path.
+    try:
+        await ws.accept()
+    except Exception:
+        with _ws_connection_lock:
+            _ws_active_connections = max(0, _ws_active_connections - 1)
+        raise
 
     briefing = get_briefing()
     session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1780,7 +1822,11 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                     )
 
                     await ws.send_json({"type": "tool_result", "id": tc_id, "result": result[:300]})
-                    tool_results.append({"role": "tool", "content": result, "name": name})
+                    tool_results.append({
+                        "role": "tool",
+                        "content": _agent.wrap_tool_output(name, result),
+                        "name": name,
+                    })
 
                 messages.extend(tool_results)
 
@@ -1828,9 +1874,11 @@ def _model_fits(param_size_str: str, ram_gb: float) -> str:
     return "no"
 
 @app.get("/api/models")
-async def list_models(authorization: str = Header(default=None), x_token: str = Header(default=None)):
+async def list_models(authorization: str = Header(default=None),
+                      x_token: str = Header(default=None),
+                      cortex_session: str = Cookie(default="")):
     """List Ollama models with capabilities and compatibility info."""
-    _require_auth(authorization, x_token)
+    _require_auth(authorization, x_token, cookie_token=cortex_session)
     ram_gb = _get_ram_gb()
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
@@ -1858,9 +1906,12 @@ async def list_models(authorization: str = Header(default=None), x_token: str = 
         return {"models": [], "current": OLLAMA_MODEL, "error": str(e)}
 
 @app.post("/api/model")
-async def switch_model(body: dict, authorization: str = Header(default=None), x_token: str = Header(default=None)):
+async def switch_model(body: dict,
+                       authorization: str = Header(default=None),
+                       x_token: str = Header(default=None),
+                       cortex_session: str = Cookie(default="")):
     """Switch the active model. Validates against available Ollama models."""
-    _require_auth(authorization, x_token)
+    _require_auth(authorization, x_token, cookie_token=cortex_session)
     global OLLAMA_MODEL
     new_model = body.get("model", "")
     if not new_model or not isinstance(new_model, str):
@@ -1879,15 +1930,20 @@ async def switch_model(body: dict, authorization: str = Header(default=None), x_
     return {"ok": True, "model": OLLAMA_MODEL}
 
 @app.get("/api/sessions")
-async def list_sessions(authorization: str = Header(default=None), x_token: str = Header(default=None)):
+async def list_sessions(authorization: str = Header(default=None),
+                        x_token: str = Header(default=None),
+                        cortex_session: str = Cookie(default="")):
     """List saved sessions."""
-    _require_auth(authorization, x_token)
+    _require_auth(authorization, x_token, cookie_token=cortex_session)
     return {"sessions": _list_sessions_local()}
 
 @app.get("/api/session/{session_id}")
-async def get_session(session_id: str, authorization: str = Header(default=None), x_token: str = Header(default=None)):
+async def get_session(session_id: str,
+                      authorization: str = Header(default=None),
+                      x_token: str = Header(default=None),
+                      cortex_session: str = Cookie(default="")):
     """Load a session."""
-    _require_auth(authorization, x_token)
+    _require_auth(authorization, x_token, cookie_token=cortex_session)
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session id format")
     data = _load_session_local(session_id)
@@ -1896,9 +1952,12 @@ async def get_session(session_id: str, authorization: str = Header(default=None)
     return data
 
 @app.delete("/api/session/{session_id}")
-async def delete_session(session_id: str, authorization: str = Header(default=None), x_token: str = Header(default=None)):
+async def delete_session(session_id: str,
+                         authorization: str = Header(default=None),
+                         x_token: str = Header(default=None),
+                         cortex_session: str = Cookie(default="")):
     """Delete a session."""
-    _require_auth(authorization, x_token)
+    _require_auth(authorization, x_token, cookie_token=cortex_session)
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session id format")
     path = SESSIONS_DIR / f"{session_id}.json"

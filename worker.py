@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 # Import agent modules
 sys.path.insert(0, str(Path(__file__).parent))
 from agent import (
-    execute_tool, call_model, build_system_prompt,
+    execute_tool, call_model, call_anthropic, build_system_prompt,
     TOOLS, OLLAMA_URL, OLLAMA_MODEL, CS_URL, ANTHROPIC_KEY,
     MAX_TOOL_LOOPS, CONTEXT_MAX_TOKENS, C
 )
@@ -418,8 +418,7 @@ def main():
 {C.BLUE}+======================================================+{C.RESET}
 """)
 
-    # Init modules
-    from agent import call_anthropic
+    # Init modules (call_anthropic imported at module top)
     policy = PolicyEngine()
     recovery = RecoveryEngine(
         fallback_fn=call_anthropic if ANTHROPIC_KEY else None,

@@ -203,6 +203,73 @@ def test_normalize_path_tilde_and_traversal():
     assert _normalize_path("~/.ssh/id_rsa").endswith("/.ssh/id_rsa")
 
 
+# ─── glob_find must inherit credential deny (N-01) ───────────────────────
+def test_glob_find_cannot_enumerate_credentials():
+    """glob_find had allow=[".*"] with no deny — red team pointed out that
+    `**/id_rsa` or `.ssh/*` would let the model discover credential files
+    that read_file / list_dir deny. Closed in v1.0.7."""
+    p = PolicyEngine()
+    # Pattern + path are concatenated for the check; either side triggering
+    # a credential pattern must DENY.
+    assert _deny(p, "glob_find", {"pattern": "**/id_rsa", "path": "/home/tomek/.ssh"})
+    assert _deny(p, "glob_find", {"pattern": "*", "path": "/home/tomek/.aws"})
+    assert _deny(p, "glob_find", {"pattern": "credentials", "path": "/home/tomek/.aws"})
+    assert _deny(p, "glob_find", {"pattern": "**/.bash_history", "path": "/home/tomek"})
+    # Benign globs still work.
+    assert _allow(p, "glob_find", {"pattern": "*.py", "path": "/tmp"})
+
+
+# ─── Custom policy re-expands shared lists (H-02) ────────────────────────
+def test_custom_policy_shared_list_reexpansion(tmp_path):
+    """When a user's policy.json adds to _CREDENTIAL_DENY, the addition
+    must flow through to every consuming tool — read_file, write_file,
+    edit_file, grep_search, list_dir, glob_find. v1.0.6 dropped these
+    keys silently."""
+    import json as _json
+    custom = tmp_path / "policy.json"
+    custom.write_text(_json.dumps({
+        "_CREDENTIAL_DENY": [r"\.myvault(/|$)"],
+    }))
+    p = PolicyEngine(policy_file=str(custom))
+    for tool in ("read_file", "write_file", "edit_file", "grep_search", "list_dir"):
+        assert _deny(p, tool, {"path": "/home/tomek/.myvault/secret"}), \
+            f"custom _CREDENTIAL_DENY didn't reach {tool}"
+    assert _deny(p, "glob_find", {"pattern": "*", "path": "/home/tomek/.myvault"})
+
+
+# ─── Regressions closed in v1.0.7 (R-01, R-02) ───────────────────────────
+def test_npmrc_pypirc_denied_on_read():
+    """.npmrc and .pypirc carry live registry auth tokens — v1.0.6 only
+    denied them on write_file; read_file / grep_search were open."""
+    p = PolicyEngine()
+    for path in ["/home/tomek/.npmrc", "/home/tomek/.pypirc"]:
+        assert _deny(p, "read_file", {"path": path}), f"read_file allowed {path}"
+        assert _deny(p, "grep_search", {"path": path})
+
+
+def test_cortex_sessions_denied_on_read():
+    """.cortex/sessions/ stores prior tool_output — reading it bypasses
+    every other read deny via the session transcript."""
+    p = PolicyEngine()
+    assert _deny(p, "read_file", {"path": "/home/tomek/.cortex/sessions/20260413.json"})
+    assert _deny(p, "list_dir", {"path": "/home/tomek/.cortex/sessions"})
+
+
+# ─── export regex narrowed (v1.0.7 LOW) ──────────────────────────────────
+def test_legitimate_export_allowed():
+    """`export PATH=...` is benign shell config; only `export -p` dumps."""
+    p = PolicyEngine()
+    assert _allow(p, "bash", {"command": "export PATH=/usr/local/bin:$PATH"})
+    assert _allow(p, "bash", {"command": "export FOO=bar"})
+    assert _deny(p,  "bash", {"command": "export -p"})
+
+
+# ─── env/printenv argv0 denial (v1.0.7 LOW) ──────────────────────────────
+def test_env_printenv_argv0():
+    assert _argv0_check("  env  ") is not None
+    assert _argv0_check("printenv FOO") is not None
+
+
 # ─── Positive cases (regression: we didn't over-block) ───────────────────
 def test_legitimate_paths_still_allowed():
     p = PolicyEngine()

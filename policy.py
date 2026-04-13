@@ -42,6 +42,9 @@ _ARGV0_DENY = {
     # on this list — they have too many legitimate uses; the regex pass
     # handles their dangerous forms (pipe-to-shell).
     "nc", "ncat", "socat",
+    # Environment dump helpers — regex also catches these but argv[0]
+    # produces a clearer denial reason for the user (audit R4 LOW).
+    "env", "printenv",
 }
 
 def _argv0_check(cmd: str) -> Optional[str]:
@@ -58,7 +61,11 @@ def _argv0_check(cmd: str) -> Optional[str]:
     """
     try:
         tokens = shlex.split(cmd, posix=True)
-    except ValueError:
+    except ValueError as e:
+        # Unbalanced quotes / trailing backslash — fall through to the
+        # regex pass but leave a breadcrumb so forensic replays of denied
+        # sessions can see the parse was abandoned (audit R4 LOW).
+        log.debug("argv0_check: shlex.split failed on %r: %s", cmd[:120], e)
         return None
     if not tokens:
         return None
@@ -133,7 +140,10 @@ DEFAULT_POLICIES = {
             # so this is heuristic — see the module header and SECURITY.md.
             r"^\s*env(\s|$)",
             r"^\s*printenv(\s|$)",
-            r"^\s*export(\s|$)",  # `export -p` dumps; other forms benign
+            # Only deny `export -p` (dumps all env like printenv); plain
+            # `export PATH=...` is a legitimate shell operation and blocking
+            # it breaks common init snippets (audit R4 LOW).
+            r"^\s*export\s+-p\b",
             r"\$\{?ANTHROPIC_API_KEY\}?",
             r"\$\{?WEB_TOKEN\}?",
             # Reverse-shell one-liners commonly used post-injection.
@@ -228,6 +238,14 @@ DEFAULT_POLICIES = {
         r"\.netrc$",
         r"\.git-credentials$",
         r"\.config/.*(token|credentials|secret|apikey|api_key)",
+        # R-02 regression (v1.0.6): npmrc/pypirc were only on the write
+        # persistence list; their `_authToken` / `password` fields are
+        # live credentials and read_file/grep_search must deny them too.
+        r"\.npmrc$", r"\.pypirc$",
+        # R-01 regression (v1.0.6): Cortex's own session store contains
+        # prior tool_output (file contents, bash output) — reading it
+        # defeats read_file denies through the back door.
+        r"(^|/)\.cortex/sessions(/|$)",
     ],
 
     # Historical files often contain typed passwords, tokens, or sensitive
@@ -292,6 +310,11 @@ DEFAULT_POLICIES = {
         ],
     },
     "glob_find": {
+        "deny": [
+            # filled in by _expand_shared_lists() — otherwise glob_find is an
+            # obvious bypass: `**/id_rsa` or `.ssh/*` would enumerate credential
+            # filenames without ever calling read_file/list_dir.
+        ],
         "allow": [".*"]
     },
     # Plugin tools inherit ALLOW by default — add custom rules here
@@ -326,15 +349,24 @@ def _expand_shared_lists(policies: dict) -> dict:
         list(credential) + list(history) + list(policies["read_file"].get("deny", []))
     )
 
-    # grep_search and list_dir must not become a read_file bypass: if
-    # read_file denies a credential, grep_search across the same path
-    # would still let the model enumerate its contents.
-    for tool in ("grep_search", "list_dir"):
+    # grep_search, list_dir and glob_find must not become a read_file bypass:
+    # if read_file denies a credential, an unrestricted search/enumeration
+    # across the same path would still let the model discover or read it.
+    for tool in ("grep_search", "list_dir", "glob_find"):
         rules = policies.setdefault(tool, {"deny": [], "allow": [r".*"]})
         rules["deny"] = list(credential) + list(history) + list(rules.get("deny", []))
 
     return policies
 
+
+# Snapshot the shared lists before expansion — PolicyEngine._merge_policies
+# needs them to re-expand when a user adds entries via custom policy.json.
+# _expand_shared_lists mutates (pops) these keys, so we grab copies first.
+SHARED_DEFAULTS = {
+    k: list(DEFAULT_POLICIES.get(k, []))
+    for k in ("_CREDENTIAL_DENY", "_PERSISTENCE_DENY",
+              "_HISTORY_DENY", "_SYSTEM_DIRS_DENY")
+}
 
 DEFAULT_POLICIES = _expand_shared_lists(DEFAULT_POLICIES)
 
@@ -385,7 +417,13 @@ def _get_check_value(tool_name: str, args: dict) -> str:
     elif tool_name == "list_dir":
         return _normalize_path(args.get("path", ""))
     elif tool_name == "glob_find":
-        return args.get("pattern", "") + " " + _normalize_path(args.get("path", ""))
+        # Return pattern and path as newline-separated values. The check()
+        # loop applies re.search (not fullmatch), so anchored patterns like
+        # `\.bash_history$` only hit end-of-line — newline makes the two
+        # halves independent line endings. re.DOTALL stays on elsewhere
+        # but `$` in MULTILINE-aware search still matches end-of-line;
+        # we enable MULTILINE explicitly in check() for this tool.
+        return args.get("pattern", "") + "\n" + _normalize_path(args.get("path", ""))
     elif tool_name == "grep_search":
         return _normalize_path(args.get("path", ""))
     return json.dumps(args)
@@ -396,6 +434,7 @@ class PolicyEngine:
         # deepcopy: DEFAULT_POLICIES contains nested lists; shallow copy would
         # make two PolicyEngine instances share the same underlying lists.
         self.policies = copy.deepcopy(DEFAULT_POLICIES)
+        self._shared_defaults = copy.deepcopy(SHARED_DEFAULTS)
         self.user_overrides: dict = {}
 
         # zaladuj custom policies jesli sa
@@ -409,8 +448,24 @@ class PolicyEngine:
                     log.warning("Failed to load custom policy %s: %s", pf, e)
 
     def _merge_policies(self, custom: dict):
-        """Merge custom policies z default."""
+        """Merge custom policies z default.
+
+        Shared-list keys (``_CREDENTIAL_DENY``, ``_PERSISTENCE_DENY``,
+        ``_HISTORY_DENY``, ``_SYSTEM_DIRS_DENY``) in *custom* must be re-
+        expanded across every tool that inherits from them — otherwise a
+        user adding ``~/.vault/`` to ``_CREDENTIAL_DENY`` would only see it
+        applied if they *also* listed every consumer tool by hand. v1.0.6
+        silently dropped these keys on the floor.
+        """
+        shared_keys = {
+            "_CREDENTIAL_DENY", "_PERSISTENCE_DENY",
+            "_HISTORY_DENY", "_SYSTEM_DIRS_DENY",
+        }
+        has_shared = any(k in custom for k in shared_keys)
+
         for tool, rules in custom.items():
+            if tool in shared_keys:
+                continue  # handled by re-expansion below
             if tool not in self.policies:
                 self.policies[tool] = rules
             else:
@@ -418,6 +473,20 @@ class PolicyEngine:
                     if key in rules:
                         existing = self.policies[tool].get(key, [])
                         self.policies[tool][key] = rules[key] + existing
+
+        if has_shared:
+            # Re-run the shared-list expansion with the user's additions
+            # prepended to the defaults so user rules take precedence.
+            merged_shared = {
+                k: list(custom.get(k, [])) + list(self._shared_defaults.get(k, []))
+                for k in shared_keys
+            }
+            # _expand_shared_lists consumes the underscore keys via pop(),
+            # so feed a combined dict (tool rules + shared lists) and
+            # write back the expanded result.
+            combined = dict(self.policies)
+            combined.update(merged_shared)
+            self.policies = _expand_shared_lists(combined)
 
     def check(self, tool_name: str, args: dict) -> tuple[str, str]:
         """
@@ -441,7 +510,7 @@ class PolicyEngine:
         # deny first
         for pattern in rules.get("deny", []):
             try:
-                if re.search(pattern, value, re.IGNORECASE | re.DOTALL):
+                if re.search(pattern, value, re.IGNORECASE | re.DOTALL | re.MULTILINE):
                     return PolicyDecision.DENY, f"Zablokowane przez regułę: {pattern}"
             except re.error:
                 continue
@@ -449,7 +518,7 @@ class PolicyEngine:
         # then ask
         for pattern in rules.get("ask", []):
             try:
-                if re.search(pattern, value, re.IGNORECASE | re.DOTALL):
+                if re.search(pattern, value, re.IGNORECASE | re.DOTALL | re.MULTILINE):
                     return PolicyDecision.ASK, f"Wymaga potwierdzenia: {pattern}"
             except re.error:
                 continue
@@ -457,7 +526,7 @@ class PolicyEngine:
         # then allow
         for pattern in rules.get("allow", []):
             try:
-                if re.search(pattern, value, re.IGNORECASE | re.DOTALL):
+                if re.search(pattern, value, re.IGNORECASE | re.DOTALL | re.MULTILINE):
                     return PolicyDecision.ALLOW, "OK"
             except re.error:
                 continue

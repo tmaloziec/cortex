@@ -338,17 +338,114 @@ that regresses them will fail CI.
   persistence gaps, NUL stripping, argv0 edge cases, and legitimate
   allows (so a future over-tightening fails visibly).
 
-## Known limitations (v1.0.6)
+### v1.0.7 additions
 
-- The bootstrap URL printed at startup still contains `?token=…` because
-  browsers can't attach an `Authorization` header to the first `GET /`.
-  The token is stripped from the URL in-browser on first load, stored in
-  `sessionStorage`, and redacted in server access logs, but it still
-  transits the local loopback once. Treat that first URL as sensitive and
-  do not paste it into chat/issue trackers.
-- The WebSocket handshake currently authenticates via `?token=`. A future
-  release is expected to switch to `Sec-WebSocket-Protocol`-based auth so
-  the token never appears in any URL.
+Round-4 audit (Claude code-review, Claude red team, Perplexity via Claude
+Code with an isolated `git clone`) produced three blockers plus a set of
+regressions and edges. All closed in v1.0.7; test suite expanded from 19
+to 23 cases.
+
+- **`glob_find` credential bypass (N-01).** `glob_find` had `allow=[".*"]`
+  with no deny — `**/id_rsa`, `.ssh/*` would enumerate credential
+  filenames that `read_file` / `list_dir` refused. `_expand_shared_lists()`
+  now includes `glob_find` alongside `grep_search` / `list_dir`, so the
+  credential + history surface is gated identically across every
+  discovery/read tool. Found independently by two audit passes.
+- **WebSocket slot leak on accept failure (H-01).** `_ws_active_connections`
+  was incremented before `ws.accept()` and only released in a `finally`
+  block around the *post-accept* loop. A peer that hung up during the
+  handshake, or any exception in `accept()`, permanently leaked a slot —
+  after `MAX_WS_CONNECTIONS` such events the server stopped accepting
+  anyone. Fixed with a `try/except` around `accept()` that releases the
+  slot on any exception before re-raising.
+- **Custom policy shared-list re-expansion (H-02).** A user's
+  `policy.json` could extend `_CREDENTIAL_DENY` etc., but `_merge_policies`
+  dropped those keys silently — they never reached `read_file`,
+  `grep_search`, `glob_find`, `list_dir`, `write_file`, `edit_file`.
+  `_merge_policies` now re-runs `_expand_shared_lists()` when custom
+  shared keys are present, with user entries prepended so they take
+  precedence. `SHARED_DEFAULTS` snapshots the originals at import time
+  (the expansion pass mutates the source dict).
+- **Plugin `sys.modules` rollback.** Plugins are loaded under a
+  `cortex_plugins.<stem>` namespace (no longer at the top level, so a
+  plugin file named `os.py` can't shadow `os`). The module is registered
+  in `sys.modules` before `exec_module()` (needed for intra-plugin
+  imports) and removed on failure — a plugin that raises in its top-
+  level body no longer leaves a half-initialised stub cached for the
+  remaining lifetime of the process.
+
+### § Token lifecycle
+
+- **v1.0.7.** The bootstrap URL still carries `?token=…` (browsers can't
+  attach an `Authorization` header to the first `GET /`), but the flow
+  is now:
+  1. First `GET /?token=…` validates the token, sets an **HttpOnly,
+     SameSite=Strict, Secure-when-HTTPS** session cookie (`cortex_session`,
+     8 h lifetime), and redirects with `303` to a clean `/`.
+  2. The server strips `token` from the URL **before** the browser
+     records it in history or sends a Referer.
+  3. WebSocket and `/api/*` now accept the cookie preferentially; the
+     `?token=` / `X-Token` / `Authorization: Bearer` paths remain for
+     CLI harnesses and curl tests. JS never reads the cookie.
+  Upstream: long-lived token replay via shared URL / screenshot / screen-
+  share (red team #6) no longer works beyond the one bootstrap load.
+- **Local vs CS-backed tokens.** Cortex remains a local agent with a
+  Jupyter-style long-lived `AUTH_TOKEN`. A future `CORTEX_AUTH_MODE=cs`
+  will exchange this for a CS-issued short-lived JWT with rotation and
+  revocation; tracked in the CS publication plan and out of scope for
+  v1.0.7.
+
+### § Prompt injection
+
+Cortex treats model input in two classes:
+
+- **Authoritative:** the system prompt and user chat turns.
+- **Untrusted:** everything that arrives via a tool — file contents,
+  bash output, web responses, CS briefings, plugin returns.
+
+As of v1.0.7, tool results are wrapped in
+`<tool_output untrusted="true" tool="…">…</tool_output>` before being
+appended to the conversation. Literal `</tool_output>` inside the payload
+is escaped so a crafted file cannot close the container early and inject
+out-of-band instructions. The system prompt includes an explicit rule
+(#13) telling the model to treat the contents as data and to refuse
+instructions that appear inside them. This is a defence-in-depth
+measure — it does not and cannot prove prompt-injection resistance for
+any specific model — but it materially shifts the burden for an attacker
+who has landed content into a file the agent will later read.
+
+### § DoS acceptance
+
+Cortex is a single-user local agent. Classic DoS surface (connection
+exhaustion, memory blowup, runaway loops) is bounded by:
+
+- `MAX_WS_CONNECTIONS` (default 10, clamped to `[1, 1000]`) — prevents
+  a runaway client or hostile LAN peer from spawning unlimited WS
+  sessions.
+- `MAX_TOOL_LOOPS` / `WS_MAX_MESSAGE_CHARS` / `TOOL_ASK_TIMEOUT` (clamped)
+  cap a single session's agent loop, message size, and pending prompt.
+- `_ws_active_connections` is released on every exit path including
+  `ws.accept()` failure (v1.0.7 fix).
+
+We do **not** defend against:
+
+- Local users on the same machine killing or starving the Cortex
+  process — they already own the trust boundary.
+- An operator who sets `WEB_TOKEN=""`, binds to `0.0.0.0`, and exposes
+  the port to the public internet. The startup banner refuses this
+  combination unless `WEB_INSECURE=1` is set; ignoring the warning is
+  not a vulnerability.
+
+## Known limitations (v1.0.7)
+
+- The bootstrap URL printed at startup still contains `?token=…` for the
+  *first* load. The token is now immediately exchanged for an HttpOnly
+  cookie and redirected away, but treat the initial URL as sensitive
+  and do not paste it into chat/issue trackers.
+- The WebSocket handshake falls back to `?token=` when no cookie is
+  attached (CLI clients, tests). A future release is expected to use
+  `Sec-WebSocket-Protocol`-based auth so the token never appears in any
+  URL even for those clients.
 - `get_ram_gb()` reads `/proc/meminfo` and returns `0` on macOS/Windows,
   which makes the "fits-in-RAM" hint in the model picker unreliable off
   Linux. It does not affect security.
