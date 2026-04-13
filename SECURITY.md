@@ -672,6 +672,69 @@ Known limitations (v1.0.7.5):
   failures. Success is silent. Acceptable for a single-user local
   tool; tracked for later.
 
+### v1.0.7.6 additions (round-10: unified UntrustedInput invariant)
+
+Round 10's code review identified the same meta-finding R9 had
+flagged internally — fixes were landing at call sites instead of on
+an invariant. R10 acts on it: every untrusted ingress now goes
+through a single helper (`wrap_untrusted`) so the nonce / escape /
+attribute-safety contract lives in one place.
+
+- **Unified `wrap_untrusted` invariant.** Every untrusted ingress —
+  tool output, compacted history, CS briefing, worker task — now
+  goes through one helper that emits
+  `<{kind}_<nonce> untrusted="true" ...>…</{kind}_<nonce>>` with
+  per-call nonce, attribute escaping (`html.escape(..., quote=True)`),
+  and close-tag scrubbing. `wrap_tool_output` kept as a thin alias
+  for call-site compatibility.
+- **CS briefing injection (R10/#1, HIGH).** `build_system_prompt`
+  previously inserted the CS briefing into the `role=system` message
+  as-is. A compromised / SSRF'd CS, or one serving cached content a
+  prior session poisoned, could plant fake rules directly into the
+  highest-trust role. **Fixed:** briefing now wraps through
+  `wrap_untrusted("external_briefing", ...)` and rule #13 enumerates
+  the KINDs explicitly — the model knows the container is untrusted
+  even though it appears in the system message.
+- **`<compacted_history>` nonce migration.** R9's direct
+  inline-nonce code replaced by a `wrap_untrusted("compacted_history",
+  ...)` call. Same semantics, one source of truth.
+- **Worker `<task>` fence migration (R10/#4).** `worker.py`'s
+  hand-rolled XML fence (`<task id="…" priority="…"><title>…`)
+  replaced by `wrap_untrusted("worker_task", body, id=task_id)`.
+  Rule #13 now lists `worker_task_<nonce>` alongside the other
+  untrusted containers.
+- **Authenticated per-session rate limit (R10/#2, MED).** A stolen
+  8h cookie used to mean unlimited API. Added
+  `_SESSION_RATE_LIMIT=600/minute/session` inside each session
+  record. Real human traffic never approaches this; scripted
+  cookie-replay attacks hit 429 within seconds.
+- **Session revocation endpoint (R10/#5, LOW).** `POST /api/logout`
+  now pops the session id from the server-side table and tells the
+  browser to delete the cookie. Stolen cookie stops working the
+  moment the operator hits logout.
+- **Token-redact filter extended to root + worker loggers (R10/#3,
+  MED).** The `_TokenRedactFilter` previously only attached to
+  uvicorn loggers. Now it's on the root logger plus `agent`,
+  `worker`, `policy`, `compactor`, `recovery` so any future
+  `log.info(request.url)` in any module gets the same scrubbing.
+- **`execute_tool` path normalisation (R10/#6, LOW).** Policy
+  evaluated paths in resolved form, but the tool opened
+  `args["path"]` raw — a TOCTOU gap if a symlink flipped between
+  the check and the syscall. `execute_tool` now runs the same
+  `_normalize_path` on `args["path"]` at entry. Belt-and-braces
+  with the policy check upstream.
+
+Known limitations (v1.0.7.6):
+
+- The unified `wrap_untrusted` contract lives in `agent.py`. New
+  ingress types (plugins, MCP, email, file-watcher) must explicitly
+  call it — we have not yet moved the per-role integration
+  downstream of a single `messages.append` hook. That refactor is a
+  v1.1 item.
+- CS auth service (JWT issuance, agent registry, revocation UI)
+  still in the v1.1 roadmap; the server-side session table is a
+  local-only bridge.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection

@@ -109,8 +109,15 @@ class _TokenRedactFilter(logging.Filter):
             pass
         return True
 
-for _name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
-    logging.getLogger(_name).addFilter(_TokenRedactFilter())
+# R10/#3: attach the redaction filter to the root logger as well so any
+# future `logging.info("url: %s", request.url)` in agent / plugin / our
+# own code gets the same scrubbing. Named uvicorn loggers kept for
+# clarity (root-attached filter also catches them, but explicit helps
+# when uvicorn is configured with propagate=False).
+_redact_filter = _TokenRedactFilter()
+for _name in ("", "uvicorn.access", "uvicorn.error", "uvicorn",
+              "agent", "worker", "policy", "compactor", "recovery"):
+    logging.getLogger(_name).addFilter(_redact_filter)
 
 # Tool names are model-produced; reject anything outside this shape before
 # logging, dispatching, or rendering in the UI. Prevents XSS via crafted
@@ -164,8 +171,37 @@ AUTH_COOKIE_NAME = "cortex_session"
 # is a dict.pop() away; cookie expiry is authoritative (not cosmetic).
 _SESSION_TTL_SEC = 60 * 60 * 8    # 8h — matches cookie max_age
 _SESSION_LIMIT   = 64             # hard cap on live sessions per process
-_sessions: dict[str, float] = {}  # session_id -> monotonic expiry time
+# R10: session record is {"expiry": monotonic_float, "hits": [float, ...]}
+# so the per-session rate-limit counter lives alongside expiry.
+_sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
+
+# R10/#2: soft per-session throttle on authenticated traffic. A stolen
+# 8h cookie used to mean unlimited API — this caps a single session to
+# _SESSION_RATE_LIMIT requests per _SESSION_RATE_WINDOW seconds. Does
+# not stop a local human operator (realistic traffic is nowhere near
+# the limit), but does blunt a scripted attacker who obtained a cookie.
+# Counter-value lives inside the session record.
+_SESSION_RATE_LIMIT  = 600
+_SESSION_RATE_WINDOW = 60.0
+
+def _note_session_hit(sid: str) -> bool:
+    """Record one authenticated request on *sid*; return True when the
+    session is over the rate budget for the current window."""
+    if not sid:
+        return False
+    import time as _time
+    now = _time.monotonic()
+    with _sessions_lock:
+        rec = _sessions.get(sid)
+        if rec is None or not isinstance(rec, dict):
+            return False
+        rec_hits = rec.setdefault("hits", [])
+        cutoff = now - _SESSION_RATE_WINDOW
+        rec_hits[:] = [t for t in rec_hits if t > cutoff][-_SESSION_RATE_LIMIT:]
+        rec_hits.append(now)
+        return len(rec_hits) > _SESSION_RATE_LIMIT
+
 
 def _mint_session() -> str:
     """Create a new session id, register it, return it. Caller sets the
@@ -174,18 +210,16 @@ def _mint_session() -> str:
     sid = secrets.token_urlsafe(32)
     expiry = _time.monotonic() + _SESSION_TTL_SEC
     with _sessions_lock:
-        # Cap + opportunistic GC so a replay-spammer can't grow the dict.
         now = _time.monotonic()
         if len(_sessions) >= _SESSION_LIMIT:
-            expired = [k for k, v in _sessions.items() if v < now]
+            expired = [k for k, v in _sessions.items() if v.get("expiry", 0) < now]
             for k in expired:
                 _sessions.pop(k, None)
             if len(_sessions) >= _SESSION_LIMIT:
-                # Drop the oldest to make room — prevents the cap from
-                # being used as a lockout vector.
-                oldest = min(_sessions.items(), key=lambda kv: kv[1])[0]
+                oldest = min(_sessions.items(),
+                             key=lambda kv: kv[1].get("expiry", 0))[0]
                 _sessions.pop(oldest, None)
-        _sessions[sid] = expiry
+        _sessions[sid] = {"expiry": expiry, "hits": []}
     return sid
 
 def _check_session_cookie(sid: str) -> bool:
@@ -195,10 +229,10 @@ def _check_session_cookie(sid: str) -> bool:
         return False
     import time as _time
     with _sessions_lock:
-        expiry = _sessions.get(sid)
-        if expiry is None:
+        rec = _sessions.get(sid)
+        if rec is None:
             return False
-        if expiry < _time.monotonic():
+        if rec.get("expiry", 0) < _time.monotonic():
             _sessions.pop(sid, None)
             return False
     return True
@@ -319,6 +353,11 @@ def _require_auth(request=None, authorization: str = None, x_token: str = None,
     `/api/sessions?token=...`.
     """
     if cookie_token and _check_session_cookie(cookie_token):
+        # R10/#2: authenticated per-session throttle. A stolen cookie
+        # used to mean unlimited API; now 600 req/min/session caps the
+        # scripted exfil case without impacting realistic human traffic.
+        if _note_session_hit(cookie_token):
+            raise HTTPException(status_code=429, detail="Session rate limit exceeded")
         return
     token = ""
     if authorization and authorization.startswith("Bearer "):
@@ -1669,6 +1708,21 @@ async def root(request: Request,
         # got close on. Clients that legitimately hit this can wait 60s.
         raise HTTPException(status_code=429, detail="Too many auth failures")
     raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+@app.post("/api/logout")
+async def logout(request: Request,
+                 cortex_session: str = Cookie(default="")):
+    """R10/#5: end the current session. Removes the session id from the
+    in-memory table so a stolen cookie stops working immediately. No
+    auth required beyond presenting a cookie — unauthenticated POSTs
+    just noop. Clears the cookie on the client side too."""
+    if cortex_session:
+        with _sessions_lock:
+            _sessions.pop(cortex_session, None)
+    resp = Response(status_code=204)
+    resp.delete_cookie(key=AUTH_COOKIE_NAME, path="/")
+    return resp
+
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
