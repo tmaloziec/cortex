@@ -27,8 +27,8 @@
 # in the same diff.
 /.github/                   @tmaloziec
 /CODEOWNERS                 @tmaloziec
-/conftest.py                @tmaloziec
 /run.sh                     @tmaloziec
+# conftest.py listed if/when it's added.
 
 # Dependency pins (CVE-relevant).
 /requirements.txt           @tmaloziec

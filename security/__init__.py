@@ -29,10 +29,14 @@ from security.messages import (
     make_system_note,
     make_user_note,
     UNTRUSTED_KINDS,
+    Role,
+    Message,
+    ToolMessage,
 )
 from security.auth import (
     ClientIdentity,
     require_auth,
+    build_require_auth,
     public_endpoint,
     SessionManager,
     rate_limit_key,
@@ -40,18 +44,18 @@ from security.auth import (
     AuthError,
 )
 from security.paths import normalize_path, path_under
-from security.fallback import FallbackPolicy
+from security.fallback import FallbackPolicy, _FallbackSentinel
 
 __all__ = [
     # messages
     "wrap_untrusted", "wrap_tool_output",
     "make_message", "make_tool_result", "make_system_note", "make_user_note",
-    "UNTRUSTED_KINDS",
+    "UNTRUSTED_KINDS", "Role", "Message", "ToolMessage",
     # auth
-    "ClientIdentity", "require_auth", "public_endpoint",
+    "ClientIdentity", "require_auth", "build_require_auth", "public_endpoint",
     "SessionManager", "rate_limit_key", "note_auth_fail", "AuthError",
     # paths
     "normalize_path", "path_under",
     # fallback
-    "FallbackPolicy",
+    "FallbackPolicy", "_FallbackSentinel",
 ]

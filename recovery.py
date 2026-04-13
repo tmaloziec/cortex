@@ -66,6 +66,24 @@ class RecoveryEngine:
         compact_fn:  funkcja do kompresji kontekstu
         alert_fn:    funkcja do alertowania (np. CS note)
         """
+        # R15: runtime structural check. Red team round 7 demonstrated
+        # that AST walker for invariant #4 had an infinite family of
+        # syntactic bypasses (lambda, partial, **kwargs splat, factory
+        # functions, BoolOp, Subscript, match-case...). We stop playing
+        # AST whack-a-mole: the ONLY legitimate fallback_fn is one
+        # produced by FallbackPolicy.as_recovery_callable(), which wraps
+        # in a _FallbackSentinel. Anything else is rejected at
+        # construction time, no matter what the AST shape was.
+        if fallback_fn is not None:
+            from security import _FallbackSentinel as _FS
+            if not isinstance(fallback_fn, _FS):
+                raise TypeError(
+                    "RecoveryEngine.fallback_fn must come from "
+                    "FallbackPolicy.from_env(...).as_recovery_callable(). "
+                    "Bare call_anthropic / lambda / partial wiring is refused "
+                    "at runtime so silent Anthropic upload on Ollama blip "
+                    "can't be enabled by mistake. See security/fallback.py."
+                )
         self.fallback_fn = fallback_fn
         self.compact_fn = compact_fn
         self.alert_fn = alert_fn

@@ -1022,6 +1022,99 @@ attack the invariants again (the test file IS code and can have
 bugs too), but the class of "write the obvious pattern with a
 trivial prefix" is closed.
 
+### v1.0.8-rc3 — R15: runtime structural enforcement + governance
+
+R14 was audited by five independent passes (Claude review, Claude
+red team, Perplexity, GPT architectural, Gemini declined — indexing
+limits). Two returned fundamentals: Perplexity caught a CRITICAL
+deploy blocker (missing export broke `pip install` path), and the
+red team + Claude review both showed that AST-based invariant #4
+had the same whack-a-mole property as regex — just one level up.
+GPT argued for HMAC, TypedDict, and escape-hatch governance.
+
+R15 takes the real lessons. HMAC was rejected on threat-model
+grounds (model never verifies MACs, per-process secret breaks
+session reload, no call site for `unwrap`). Everything else landed:
+
+- **CRITICAL deploy fix.** `security/__init__.py` did not export
+  `build_require_auth`, so `from security import build_require_auth`
+  in `web.py` raised `ImportError` at startup. Moved the symbol
+  into both the re-export block and `__all__`. Seven previously
+  skipped integration tests now pass.
+
+- **Runtime structural sentinel for the fallback invariant.** Red
+  team round 7 enumerated an infinite family of AST bypasses of
+  invariant #4 (`lambda`, `functools.partial`, `getattr`,
+  `**kwargs` splat, factory function, `BoolOp`, `Subscript`,
+  assignment-through-variable, `match`-case, ...). Chasing each
+  new shape is the same whack-a-mole regex had. Fixed
+  structurally: `FallbackPolicy.as_recovery_callable()` now returns
+  a `_FallbackSentinel` instance; `RecoveryEngine.__init__` does
+  `isinstance(fallback_fn, _FallbackSentinel)` at construction
+  time. No AST shape defeats runtime type identity. Invariant #4
+  AST walker kept as belt-and-braces but the load-bearing check is
+  the `isinstance`.
+
+- **Directory-recursive invariant scanning.** `_discover_targets`
+  switched from `glob("*.py")` (root only) to `rglob("*.py")`
+  with path-part exclusion. New subdirectories (a future
+  `app/`, `routes/`, `api/`, `mcp/` layout) inherit all four
+  invariants automatically. Closes Claude R14 M-1.
+
+- **Known-public-endpoint whitelist.** Invariant #2 now requires
+  `Depends(public_endpoint)` routes to be on an explicit
+  `_KNOWN_PUBLIC_ENDPOINTS` whitelist (currently `/`, `/health`,
+  `/api/logout`, `/ws`). A new endpoint can't opt out of auth
+  just by typing `public_endpoint`; adding to the whitelist
+  requires editing the test file, which CODEOWNERS protects.
+  Closes red team E5.
+
+- **Tokenised allow-comment for invariants #2 and #3.** R14 moved
+  invariants #1 and #4 to tokenised allow-comment checks but left
+  #2 and #3 on the legacy regex-on-raw-line path — a string
+  literal containing the magic substring could satisfy the
+  exemption. Fixed: all four invariants use the same
+  `tokenize.generate_tokens` COMMENT-token-only recognition.
+  Closes red team E2.
+
+- **Default-arg freeze in message helpers.** Plugin `on_activate`
+  is trusted by design but shouldn't implicitly have "disable
+  security invariants for the process lifetime" capability. Each
+  helper now binds its security dependencies as default arguments
+  captured at `def` time (``wrap_tool_output(..., _wrap=
+  wrap_untrusted)``), so a later
+  `security.messages.wrap_untrusted = lambda *a, **kw: content`
+  monkey-patch affects only code paths that re-import after the
+  patch — not the captured local reference. Closes red team E4.
+
+- **Escape-hatch lifecycle.** GPT governance acted on: every
+  `# invariant: allow-<rule> because <reason>` comment now
+  optionally carries `until=YYYY-MM-DD`. Expired dates fail the
+  test. Existing 6 comments (tool_calls fields, separate
+  summarizer API) are grandfathered through a grace window
+  ending 2026-06-01; new allow comments added after grace must
+  carry a lifecycle date. Auto-generated `UNSAFE.md` report
+  lists every active exemption for review.
+
+- **Typed message shapes.** `Message` / `ToolMessage` /
+  `Role = Literal[...]` `TypedDict`s in `security/messages.py`
+  exported via `security/__init__.py`. `mypy --strict` now
+  catches mismatched role literals at type-check time as a
+  second defensive layer. Runtime behaviour unchanged.
+
+Verdict on GPT's 200-LOC plan: HMAC rejected as false security
+(model does not verify, threat model mismatch, per-process
+secret breaks session reload); escape-hatch lifecycle accepted
+as proposed but with a grace window for existing comments;
+AST-walker extensions (`Return`, `AnnAssign`) not required once
+the runtime sentinel landed — kept for belt-and-braces; typing
+stubs accepted; commercial documentation accepted.
+
+Test suite: 5 invariants + 51 policy = 56 green, STRICT.
+Runtime sentinel verified against direct callable, lambda wrap,
+and `functools.partial` bypass attempts — all rejected at
+`RecoveryEngine.__init__` with a pointing error message.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection

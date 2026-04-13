@@ -88,6 +88,27 @@ network, untrusted plugins), read [SECURITY.md](SECURITY.md). It documents
 the threat model, the design decisions that look like vulnerabilities but
 aren't, and how to report real security issues.
 
+### Security invariants (REQUIRED for commercial deployments)
+
+The `security/` package and `tests/test_invariants.py` define mandatory
+structural security invariants. They are enforced at CI time via an
+AST walker plus a runtime sentinel check in `RecoveryEngine`.
+
+For **commercial licensees** ([LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)):
+
+- Disabling the invariant tests or removing `security/*` helpers
+  **voids the security guarantees** the threat model is written
+  against.
+- Supported deployments MUST run `python3 tests/test_invariants.py`
+  as part of CI. A failing run is a release blocker.
+- Relaxing an invariant or adding a new untrusted KIND requires
+  review by the CODEOWNERS-listed reviewer of `security/`.
+
+Escape-hatch exemptions carry `# invariant: allow-<rule> until=YYYY-MM-DD
+because <reason>` comments and are auto-collected into
+[UNSAFE.md](UNSAFE.md) so the whole exemption surface is visible at a
+glance.
+
 ## Plugins
 
 Cortex supports plugins that add custom tools and modes. Plugins are Python files placed in the `plugins/` directory.

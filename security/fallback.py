@@ -33,6 +33,35 @@ _UNTRUSTED_TAG_RE = _re.compile(
 )
 
 
+class _FallbackSentinel:
+    """Runtime marker that a callable actually came from
+    ``FallbackPolicy.as_recovery_callable()``.
+
+    Red team round 7 showed that AST-based invariant #4 can be
+    bypassed by any indirection (``lambda``, ``functools.partial``,
+    ``**kwargs`` unpack, factory function, BoolOp, Subscript,
+    assignment-through-variable, match-case, ...). Chasing each new
+    syntax shape is the same whack-a-mole that regex-based
+    enforcement had — just one abstraction level higher.
+
+    The real fix is structural: instead of asking "does this code
+    look like a forbidden pattern?", ask "is this value an instance
+    of the one type that the policy can emit?". ``RecoveryEngine``
+    checks ``isinstance(fallback_fn, _FallbackSentinel)`` at
+    runtime. No AST shape defeats that — the ONLY way to get a
+    truthy sentinel is to call ``FallbackPolicy.as_recovery_callable()``.
+    """
+
+    def __init__(self, fn: Callable):
+        # Store the underlying logged/redacted caller; __call__
+        # forwards transparently so recovery.py doesn't need to
+        # know about the sentinel wrapper.
+        self._fn = fn
+
+    def __call__(self, messages, *args, **kwargs):
+        return self._fn(messages, *args, **kwargs)
+
+
 class FallbackPolicy:
     """Policy decision object for whether an Anthropic upload should
     happen and how it should be shaped.
@@ -63,11 +92,17 @@ class FallbackPolicy:
         redact = _os.getenv("CORTEX_FALLBACK_REDACT_TOOL_OUTPUTS") == "1"
         return cls(enabled=enabled, redact_tool_outputs=redact, call_fn=call_fn)
 
-    def as_recovery_callable(self) -> Callable | None:
-        """Return the callable to pass to ``RecoveryEngine(fallback_fn=…)``
-        or ``None`` if fallback is disabled. The callable logs every
-        upload at WARNING with payload stats, applies redaction, then
-        invokes the underlying Anthropic client."""
+    def as_recovery_callable(self) -> _FallbackSentinel | None:
+        """Return the sentinel-wrapped callable to pass to
+        ``RecoveryEngine(fallback_fn=…)`` or ``None`` if fallback is
+        disabled.
+
+        Wrapping in ``_FallbackSentinel`` is what makes invariant #4
+        enforcement structural rather than syntactic: only a return
+        value from THIS method will survive ``RecoveryEngine``'s
+        ``isinstance`` check. No amount of call-site cleverness
+        (lambda, partial, getattr, kwargs splat, factory) can
+        synthesise one without going through the policy object."""
         if not self.enabled:
             return None
         call_fn = self._call_fn
@@ -91,4 +126,4 @@ class FallbackPolicy:
             )
             return call_fn(payload, *a, **kw)
 
-        return _logged_fallback
+        return _FallbackSentinel(_logged_fallback)

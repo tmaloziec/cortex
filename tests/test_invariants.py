@@ -43,16 +43,45 @@ _EXCLUDE_DIRS = {"security", "tests", "plugins", "venv", ".venv",
                  "__pycache__", ".git", "build", "dist"}
 _EXCLUDE_FILES = {"ws_test.py"}  # CLI smoke-test, not agent code
 
+# R15 (GPT governance): escape-hatch comments are parsed for an
+# optional ``until=YYYY-MM-DD`` clause. Existing comments without an
+# expiry are grandfathered through a soft-warn grace period; new
+# comments added after the grace date MUST carry an expiry.
+_ALLOW_WITH_EXPIRY_RE = re.compile(
+    r"# invariant: allow-(?P<rule>[\w-]+)\s+until=(?P<date>\d{4}-\d{2}-\d{2})"
+    r"\s+because\s+(?P<reason>.+)"
+)
+_ALLOW_LEGACY_RE = re.compile(
+    r"# invariant: allow-(?P<rule>[\w-]+)\s+because\s+(?P<reason>.+)"
+)
+# After this date, new allow comments without until= fail the test.
+# Existing legacy comments at HEAD on this date get a "grandfathered"
+# list in UNSAFE.md; every addition must carry an until= clause.
+_GRACE_END_DATE = "2026-06-01"
+
 
 def _discover_targets():
-    """Yield (name, text) for every source file the invariants apply to."""
-    for path in sorted(_REPO.glob("*.py")):
+    """Yield (display_name, text) for every source file the invariants
+    apply to.
+
+    R15 (Claude R14 M-1): switched from ``glob("*.py")`` (root-only)
+    to ``rglob("*.py")`` so subdirectories added later (``app/``,
+    ``routes/``, ``api/``, ``mcp/``...) inherit the invariants.
+    Excludes are now path-part-based so anything under
+    ``security/``, ``tests/``, ``plugins/``, ``venv/``, etc. is
+    skipped wholesale."""
+    for path in sorted(_REPO.rglob("*.py")):
+        # path.parts relative to repo tells us whether any ancestor
+        # directory is on the exclude list.
+        try:
+            rel = path.relative_to(_REPO)
+        except ValueError:
+            continue
+        if any(part in _EXCLUDE_DIRS for part in rel.parts):
+            continue
         if path.name in _EXCLUDE_FILES:
             continue
-        yield path.name, path.read_text()
-    # Also cover the immediate top-level helper modules if they sit in
-    # a single subdir that isn't explicitly excluded. Keep this narrow
-    # for now — widen only when a new integration lands.
+        yield str(rel), path.read_text()
 
 # Phase flag. Flipped to True after R13 phase-1 migration completed —
 # all source files now route through security/* and any regression
@@ -169,7 +198,13 @@ def test_no_bare_role_dict_literals():
                     if kw.arg == "role" and isinstance(kw.value, ast.Constant):
                         role_val = kw.value.value
                         break
-            # d["role"] = "<role>"   (R14/#6)
+            # R15 (bonus, from GPT's AST extension list):
+            # d["<slice>"] = "<role>" assignment. Caught regardless of
+            # whether slice is Constant (R14 detected) or other shapes —
+            # any Subscript assignment to a 'role'-string target with a
+            # constant string value is suspect, and non-literal forms
+            # (var, expression, concat) are noted so reviewers see them
+            # even if they can't be statically classified.
             elif isinstance(node, ast.Assign):
                 for tgt in node.targets:
                     if (isinstance(tgt, ast.Subscript)
@@ -235,10 +270,32 @@ def _function_auth_dependencies(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> s
     return seen
 
 
+# R15/E5: routes legitimately allowed to use Depends(public_endpoint).
+# Anything not on this list that declares public_endpoint fails the
+# invariant — new "I'll just mark it public for now" endpoints cannot
+# ship without explicit whitelisting.
+_KNOWN_PUBLIC_ENDPOINTS = {
+    ("get", "/"),             # bootstrap HTML — token exchange handled in body
+    ("get", "/health"),       # liveness probe, returns {"status": "ok"}
+    ("post", "/api/logout"),  # must work for already-revoked/expired sessions
+    ("websocket", "/ws"),     # handshake auth handled in body; per-message
+                              # and per-tool-iteration re-auth re-validate
+                              # the cookie / master token. FastAPI Depends
+                              # on websockets doesn't go through the 401
+                              # return path, so public_endpoint + in-body
+                              # check is the supported pattern.
+}
+
+
 def test_every_route_has_auth_dependency():
     """Invariant #2: every ``@app.<verb>(...)`` / ``@app.websocket(...)``
     declares ``Depends(require_auth)`` or ``Depends(public_endpoint)``.
     Forgetting the dependency means the route ships open to the world.
+
+    R15/E5: ``Depends(public_endpoint)`` now requires the route to be
+    on the ``_KNOWN_PUBLIC_ENDPOINTS`` whitelist. A new endpoint can't
+    opt out of auth by typing ``public_endpoint`` — whitelisting
+    requires editing this test file, which CODEOWNERS protects.
 
     The dependency reference is matched by *suffix* — any identifier
     ending in ``require_auth`` / ``require_auth_dep`` / ``public_endpoint``
@@ -265,10 +322,27 @@ def test_every_route_has_auth_dependency():
                 if not routes:
                     continue
                 deps = _function_auth_dependencies(node)
-                if any(d.endswith(suf) for d in deps for suf in allowed_suffixes):
+                # `public_endpoint` is only valid for whitelisted routes.
+                uses_public = any(d.endswith("public_endpoint") for d in deps)
+                uses_authed = any(d.endswith("require_auth_dep") for d in deps)
+                if uses_authed:
                     continue
+                if uses_public:
+                    # Must be a whitelisted (verb, path) combination.
+                    path_match = False
+                    for verb, dcall in routes:
+                        if dcall.args and isinstance(dcall.args[0], ast.Constant):
+                            path = dcall.args[0].value
+                            if (verb, path) in _KNOWN_PUBLIC_ENDPOINTS:
+                                path_match = True
+                                break
+                    if path_match:
+                        continue
                 line = _line_of(src, node)
-                if _allow_comment(line, "unauth-endpoint"):
+                # R15/E2: tokenised allow-check (string literals on the
+                # route line cannot satisfy the exemption).
+                if _allow_comment(None, "unauth-endpoint",
+                                  lineno=node.lineno, src=src):
                     continue
                 verbs = ", ".join(v for v, _ in routes)
                 offenders.append(
@@ -295,7 +369,9 @@ def test_no_direct_client_host_access():
                 inner = _attr_chain(node.value)
                 if inner and inner.endswith(".client"):
                     line = _line_of(src, node)
-                    if _allow_comment(line, "direct-client-ip"):
+                    # R15/E2: tokenised allow-check.
+                    if _allow_comment(None, "direct-client-ip",
+                                      lineno=node.lineno, src=src):
                         continue
                     offenders.append(f"{fname}:{node.lineno} {line.strip()[:120]}")
     _assert(offenders, "Direct .client.host access — use ClientIdentity.from_request")
@@ -358,6 +434,95 @@ def test_fallback_goes_through_policy():
                     _fallback_suspects_from_ifexp(node.value, fname, getattr(node, "lineno", 0), src)
 
     _assert(offenders, "Bare fallback_fn wiring — use FallbackPolicy.from_env")
+
+
+# ─── INVARIANT 5: allow-comment lifecycle ────────────────────────────────
+
+def test_allow_comments_have_lifecycle():
+    """R15 (GPT governance): every ``# invariant: allow-<id> because
+    <reason>`` carries a lifecycle.
+
+    * If the comment has ``until=YYYY-MM-DD`` and the date is in the
+      past, the test fails (expired escape hatch = unfinished task).
+    * If the comment has no ``until=`` clause, it's grandfathered
+      (existing set at the time governance landed) and emitted to
+      ``UNSAFE.md`` for review. New comments lacking ``until=`` added
+      after ``_GRACE_END_DATE`` fail the test.
+
+    The generated UNSAFE.md is a regenerable report — reviewers can
+    see the whole escape surface at a glance rather than grepping
+    for the magic comment.
+    """
+    import datetime as _dt
+    today = _dt.date.today()
+    grace_end = _dt.date.fromisoformat(_GRACE_END_DATE)
+
+    offenders: list[str] = []
+    grandfathered: list[str] = []
+    with_expiry: list[str] = []
+    expired: list[str] = []
+
+    for fname, src in _targets():
+        for lineno, line in enumerate(src.splitlines(), 1):
+            # Only look at comment tokens, never string literals.
+            comments_on_line = _comment_strings_on_line(src, lineno)
+            for comment in comments_on_line:
+                m = _ALLOW_WITH_EXPIRY_RE.search(comment)
+                if m:
+                    expiry = _dt.date.fromisoformat(m.group("date"))
+                    entry = (f"{fname}:{lineno} rule={m.group('rule')} "
+                             f"until={m.group('date')} because={m.group('reason')[:80]}")
+                    if expiry < today:
+                        expired.append(entry)
+                    else:
+                        with_expiry.append(entry)
+                    continue
+                # Legacy shape with no until=
+                m2 = _ALLOW_LEGACY_RE.search(comment)
+                if m2:
+                    entry = (f"{fname}:{lineno} rule={m2.group('rule')} "
+                             f"(no until=) because={m2.group('reason')[:80]}")
+                    if today > grace_end:
+                        # Past the grace period — every allow comment
+                        # must now carry a lifecycle date.
+                        offenders.append(entry)
+                    else:
+                        grandfathered.append(entry)
+
+    # Regenerate UNSAFE.md regardless of pass/fail so the report is
+    # always current. Keep the test independent of whether writing
+    # succeeds (read-only test environments still pass).
+    try:
+        def _section(label, entries):
+            header = [f"## {label} ({len(entries)})", ""]
+            body = [f"- {e}" for e in entries] if entries else ["(none)"]
+            return header + body + [""]
+        unsafe_lines = [
+            "# Unsafe invariant exceptions",
+            "",
+            "Auto-generated by `tests/test_invariants.py::"
+            "test_allow_comments_have_lifecycle`.",
+            "Do not edit manually. Regenerate by running the test suite.",
+            "",
+            f"Generated: {today.isoformat()}  (grace ends {grace_end.isoformat()})",
+            "",
+        ]
+        unsafe_lines += _section(
+            "Active allow-comments with lifecycle", with_expiry)
+        unsafe_lines += _section(
+            "Grandfathered legacy comments", grandfathered)
+        unsafe_lines.insert(-1,
+            "These predate the governance rule. After the grace date "
+            "they must gain an `until=YYYY-MM-DD` clause or be removed.")
+        unsafe_lines += _section(
+            "Expired (test fails)", expired)
+        (_REPO / "UNSAFE.md").write_text("\n".join(unsafe_lines) + "\n")
+    except OSError:
+        pass
+
+    # Fail on expired comments always; on missing until= only after grace.
+    problems = list(expired) + list(offenders)
+    _assert(problems, "Escape-hatch comments: expired or missing until= clause")
 
 
 # ─── Phase-0 xfail wrapper ───────────────────────────────────────────────

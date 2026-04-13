@@ -27,7 +27,24 @@ from __future__ import annotations
 
 import html as _html
 import secrets as _secrets
-from typing import Any
+from typing import Any, Literal, TypedDict
+
+# R15 (GPT bonus): typed message shape. `mypy --strict` can now flag
+# a bare dict literal being passed where Message is expected — second
+# defensive layer on top of the AST walker. Runtime behaviour
+# unchanged; dicts still flow through the system.
+Role = Literal["system", "user", "assistant", "tool"]
+
+
+class Message(TypedDict, total=False):
+    role: Role
+    content: str
+
+
+class ToolMessage(TypedDict):
+    role: Literal["tool"]
+    content: str
+    name: str
 
 # The KIND prefixes the runtime may emit for untrusted ingress. Any
 # tag with one of these prefixes is DATA, regardless of nonce, role,
@@ -77,15 +94,30 @@ def wrap_untrusted(kind: str, content: Any, **attrs: Any) -> str:
     return f'<{tag} untrusted="true"{attr_s}>\n{safe}\n</{tag}>'
 
 
-def wrap_tool_output(name: str, result: str) -> str:
+# R15/E4 (red team round 7): capture security primitives as function
+# defaults so a plugin that monkey-patches ``security.messages.wrap_
+# untrusted`` at runtime (via its own on_activate hook) cannot weaken
+# the wrappers that were already defined. Each helper below binds its
+# security dependencies as default args at def time. Reassigning
+# ``security.messages.wrap_untrusted`` after the fact won't affect the
+# captured local reference.
+#
+# Plugins remain trusted-by-design, but "trusted" shouldn't mean
+# "capable of silently disabling security invariants for the rest of
+# the process". This closes that sharp edge without requiring a
+# sandbox.
+
+def wrap_tool_output(name: str, result: str,
+                     _wrap=wrap_untrusted) -> str:
     """Tool-output ingress — thin alias so existing imports keep
     working. Prefer ``make_tool_result`` for new code."""
-    return wrap_untrusted("tool_output", result, tool=name)
+    return _wrap("tool_output", result, tool=name)
 
 
 def make_message(role: str, content: str, *,
                  authoritative: bool = False,
                  source: str | None = None,
+                 _wrap=wrap_untrusted,
                  **attrs: Any) -> dict:
     """Canonical conversation-message constructor.
 
@@ -120,10 +152,12 @@ def make_message(role: str, content: str, *,
             "authoritative=False — pick one of UNTRUSTED_KINDS or add a "
             "new KIND to security/messages.py + rule #13 first."
         )
-    return {"role": role, "content": wrap_untrusted(source, content, **attrs)}
+    return {"role": role, "content": _wrap(source, content, **attrs)}
 
 
-def make_tool_result(name: str, content: str, *, source: str = "tool_output") -> dict:
+def make_tool_result(name: str, content: str, *,
+                     source: str = "tool_output",
+                     _wrap=wrap_untrusted) -> dict:
     """Canonical ``role="tool"`` message. See R11/M1.
 
     ``source`` kept for back-compat with worker.py / web.py call sites
@@ -134,7 +168,7 @@ def make_tool_result(name: str, content: str, *, source: str = "tool_output") ->
     """
     return {
         "role": "tool",
-        "content": wrap_untrusted("tool_output", content, tool=name, source=source),
+        "content": _wrap("tool_output", content, tool=name, source=source),
         "name": name,
     }
 
