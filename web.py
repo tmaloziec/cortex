@@ -307,19 +307,31 @@ def _note_auth_fail(ip: str) -> bool:
 def _client_ip(request_or_ws) -> str:
     """Return the client IP for rate-limit keying.
 
-    R9/#2: when `CORTEX_TRUST_PROXY_HEADERS=1` is set the operator is
-    responsible for only placing a trusted proxy in front of uvicorn.
-    In that case honour the LEFTMOST non-internal X-Forwarded-For entry
-    so the rate-limit doesn't collapse every real user into the proxy
-    bucket. Otherwise stick with the TCP peer."""
+    R11/M2 (corrects R9/#2):
+        Leftmost X-Forwarded-For is spoofable by the original client —
+        nginx/caddy *append* to XFF rather than replacing it, so an
+        attacker who sets ``X-Forwarded-For: 127.0.0.1`` in their own
+        request makes the proxy produce ``X-Forwarded-For: 127.0.0.1,
+        <real-ip>`` and Cortex previously picked the leftmost (attacker-
+        controlled) value. That's both a rate-limit bypass (rotate the
+        header) and a lockout vector (spoof a victim's IP to burn
+        their bucket).
+
+        Fixed by preferring headers the proxy *overwrites* instead of
+        appends: ``X-Real-IP`` (nginx ``set $real_ip``) and
+        ``CF-Connecting-IP`` (Cloudflare). Both are single-value and
+        end-to-end owned by the trusted proxy. X-Forwarded-For is no
+        longer consulted; operators who only have XFF should configure
+        their proxy to also emit X-Real-IP.
+    """
     try:
         if TRUST_PROXY_HEADERS and hasattr(request_or_ws, "headers"):
-            xff = request_or_ws.headers.get("x-forwarded-for", "")
-            if xff:
-                # Leftmost is the original client; trim whitespace.
-                first = xff.split(",")[0].strip()
-                if first:
-                    return first
+            # Single-value overwritten headers — trusted when the
+            # operator has opted into proxy-header trust.
+            for _h in ("cf-connecting-ip", "x-real-ip"):
+                v = request_or_ws.headers.get(_h, "").strip()
+                if v:
+                    return v
         client = getattr(request_or_ws, "client", None)
         if client and client.host:
             return client.host
@@ -1815,10 +1827,29 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
 
     reader_task = asyncio.create_task(_ws_reader())
 
+    # R11/M4: capture the cookie token (if any) we authed with so the
+    # main loop can periodically re-check it. A WS opened with a valid
+    # cookie previously stayed authenticated until disconnect — so a
+    # cookie stolen, replayed once to open a socket, and then kept
+    # alive would survive both expiry and /api/logout. We now re-verify
+    # on every inbound message.
+    ws_auth_cookie = cookie_token  # may be empty for CLI clients on ?token=
+
     try:
         while True:
             data = await ws_queue.get()
             if data is None:
+                break
+
+            # R11/M4: re-check the session cookie on every inbound
+            # message so a stolen cookie that has been revoked (or
+            # expired) stops working within seconds of the next user
+            # turn. CLI clients that authed via ?token= have no cookie
+            # to re-check; they keep the per-handshake authentication
+            # (still bounded by MAX_WS_CONNECTIONS + stop button).
+            if ws_auth_cookie and AUTH_TOKEN and not _check_session_cookie(ws_auth_cookie):
+                await ws.send_json({"type": "error", "content": "Session expired"})
+                await ws.close(code=4401)
                 break
 
             if data.get("type") == "clear":
@@ -2003,18 +2034,20 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                             "arg": f"rejected tool name: {str(name)[:80]}",
                             "id": tc_id,
                         })
-                        tool_results.append({
-                            "role": "tool",
-                            "content": f"[ZABLOKOWANE] Invalid tool name",
-                            "name": "invalid",
-                        })
+                        tool_results.append(_agent.make_tool_result(
+                            "invalid", "[ZABLOKOWANE] Invalid tool name",
+                            source="invalid_name",
+                        ))
                         continue
 
                     # Policy check
                     decision, reason = _policy.check(name, args)
                     if decision == PolicyDecision.DENY:
                         await ws.send_json({"type": "tool_call", "name": f"[DENY] {name}", "arg": reason, "id": tc_id})
-                        tool_results.append({"role": "tool", "content": f"[ZABLOKOWANE] {reason}", "name": name})
+                        tool_results.append(_agent.make_tool_result(
+                            name, f"[ZABLOKOWANE] {reason}",
+                            source="policy_deny",
+                        ))
                         continue
 
                     if decision == PolicyDecision.ASK:
@@ -2044,11 +2077,10 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                                 "arg": arg_preview,
                                 "id": tc_id,
                             })
-                            tool_results.append({
-                                "role": "tool",
-                                "content": f"[ZABLOKOWANE przez użytkownika] {name}",
-                                "name": name,
-                            })
+                            tool_results.append(_agent.make_tool_result(
+                                name, "[ZABLOKOWANE przez użytkownika]",
+                                source="user_reject",
+                            ))
                             continue
                         # fall through — user approved, render normal tool_call
                         await ws.send_json({"type": "tool_call", "name": name, "arg": arg_preview, "id": tc_id})
@@ -2061,11 +2093,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                     )
 
                     await ws.send_json({"type": "tool_result", "id": tc_id, "result": result[:300]})
-                    tool_results.append({
-                        "role": "tool",
-                        "content": _agent.wrap_tool_output(name, result),
-                        "name": name,
-                    })
+                    tool_results.append(_agent.make_tool_result(name, result))
 
                 messages.extend(tool_results)
 
@@ -2227,6 +2255,20 @@ if __name__ == "__main__":
         print("  This would expose unauthenticated agent control to the network.")
         print("  Either set WEB_TOKEN, bind to 127.0.0.1, or set WEB_INSECURE=1 to override.")
         sys.exit(2)
+
+    # R11/M2: the inverse of R8/T2 — warn when TRUST_PROXY_HEADERS=1 is
+    # ON but uvicorn is NOT bound to localhost. An attacker who can reach
+    # uvicorn directly sends their own X-Real-IP / CF-Connecting-IP and
+    # Cortex trusts it. Proxy trust is only safe when uvicorn is not
+    # directly reachable.
+    if TRUST_PROXY_HEADERS and not _is_localhost:
+        print()
+        print("WARNING: CORTEX_TRUST_PROXY_HEADERS=1 AND bind is not localhost.")
+        print(f"  WEB_HOST={WEB_HOST}  — uvicorn reachable directly over the network.")
+        print("  A LAN attacker can set X-Real-IP / CF-Connecting-IP / X-Forwarded-Proto")
+        print("  to any value. These headers are only trustworthy when uvicorn is")
+        print("  bound to 127.0.0.1 behind a proxy that overwrites them.")
+        print()
 
     # R8/T2: warn when the operator has broadened WEB_ORIGIN_ALLOWLIST (i.e.
     # is running behind a reverse proxy / Cloudflare Tunnel / Tailscale

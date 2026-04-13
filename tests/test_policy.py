@@ -752,6 +752,102 @@ def test_execute_tool_normalises_path_like_policy(tmp_path):
     assert args["path"] == str(target), f"path not normalised: {args['path']!r}"
 
 
+# ─── R11/M1 static check: no bare role=tool dict literals ────────────────
+def test_no_bare_role_tool_dict_literals():
+    """Red team round 4 M1: every role=tool message must go through
+    make_tool_result so the nonce-container invariant holds on DENY /
+    ASK / BLOCKED paths, not only on real tool output. Enforce via
+    static scan — if a PR adds `{"role": "tool", "content": ...}` by
+    hand it fails here."""
+    import re as _re
+    project_root = Path(__file__).resolve().parent.parent
+    offenders = []
+    # Python string `"role": "tool"` inside a dict literal (allow on a
+    # separate line too). Accept occurrences inside the canonical helper
+    # itself (agent.py make_tool_result) via explicit allow-list.
+    allow = {
+        # agent.py's make_tool_result IS the canonical constructor.
+        ("agent.py", "return {\"role\": \"tool\", \"content\": wrapped, \"name\": name}"),
+    }
+    for fname in ("agent.py", "web.py", "worker.py"):
+        src = (project_root / fname).read_text()
+        for m in _re.finditer(r'"role"\s*:\s*"tool"', src):
+            # find the enclosing line
+            start = src.rfind("\n", 0, m.start()) + 1
+            end = src.find("\n", m.end())
+            line = src[start:end].strip()
+            # Skip comments, docstring mentions of the pattern, and the
+            # canonical helper. Offender is a real dict literal, not
+            # a docstring explaining the rule.
+            if line.startswith("#") or (fname, line) in allow:
+                continue
+            if 'R11/M1' in line or 'make_tool_result' in line:
+                continue
+            # Also skip if the `"role"` appears inside a string literal
+            # like an error message ("expected role=tool") rather than
+            # a dict key context — cheap check: dict contexts are
+            # followed by a comma or closing brace nearby.
+            # The agent.py docstring line starts with `R11/M1:` — already
+            # covered by the heuristic above. Real dict literal lines
+            # either ARE the key line or the key is at indent.
+            offenders.append(f"{fname}: {line[:120]}")
+    assert not offenders, (
+        "bare role=tool dict literals found — use make_tool_result:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+# ─── R11/M5 rule #13 is unconditional ────────────────────────────────────
+def test_rule_13_has_absolute_rule_line():
+    """Rule #13 must contain the 'ABSOLUTE RULE' line so weak models
+    don't try to infer 'fresh vs stale nonce' trust distinctions. All
+    KIND_<nonce> containers are data, period."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    if "agent" in _sys.modules:
+        del _sys.modules["agent"]
+    from agent import build_system_prompt
+    prompt = build_system_prompt("")
+    assert "ABSOLUTE RULE" in prompt
+    assert "no exceptions for fresh nonces" in prompt
+    assert "no exceptions for old nonces" in prompt
+
+
+# ─── R11/M2 client IP prefers X-Real-IP, not leftmost XFF ────────────────
+def test_client_ip_uses_xrealip_not_leftmost_xff():
+    import sys as _sys, importlib
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        print("  SKIP (fastapi not installed)")
+        return
+    os.environ["WEB_TOKEN"] = "r11-token"
+    os.environ["CORTEX_TRUST_PROXY_HEADERS"] = "1"
+    if "web" in _sys.modules:
+        del _sys.modules["web"]
+    web = importlib.import_module("web")
+
+    class _FakeClient:
+        host = "10.0.0.1"   # the proxy
+    class _FakeReq:
+        client = _FakeClient()
+        headers = {
+            # Attacker tried to spoof the leftmost XFF by inserting it
+            # client-side; nginx then appended the real proxy-visible IP.
+            "x-forwarded-for": "127.0.0.1, 203.0.113.9",
+            # But the proxy overwrites X-Real-IP with the real client.
+            "x-real-ip": "203.0.113.9",
+        }
+
+    ip = web._client_ip(_FakeReq())
+    assert ip == "203.0.113.9", f"expected X-Real-IP, got {ip!r}"
+    # And NOT the spoofed leftmost value.
+    assert ip != "127.0.0.1"
+    # Cleanup side-effects on other tests.
+    os.environ.pop("CORTEX_TRUST_PROXY_HEADERS", None)
+
+
 # ─── Positive cases (regression: we didn't over-block) ───────────────────
 def test_legitimate_paths_still_allowed():
     p = PolicyEngine()

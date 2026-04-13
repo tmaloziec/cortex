@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from agent import (
     execute_tool, call_model, call_anthropic, build_system_prompt,
-    wrap_tool_output, _valid_tool_name,
+    wrap_tool_output, make_tool_result, _valid_tool_name,
     TOOLS, OLLAMA_URL, OLLAMA_MODEL, CS_URL, ANTHROPIC_KEY,
     MAX_TOOL_LOOPS, CONTEXT_MAX_TOKENS, C
 )
@@ -256,11 +256,10 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
                 # response dicts can't carry model-injected text.
                 if not _valid_tool_name(name):
                     log.warning(f"invalid tool name rejected: {str(name)[:80]!r}")
-                    tool_results.append({
-                        "role": "tool",
-                        "content": "[BLOCKED] invalid tool name",
-                        "name": "invalid",
-                    })
+                    tool_results.append(make_tool_result(
+                        "invalid", "[BLOCKED] invalid tool name",
+                        source="invalid_name",
+                    ))
                     continue
                 raw_args = fn.get("arguments", {})
                 if isinstance(raw_args, dict):
@@ -275,21 +274,18 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
                 decision, reason = policy.check(name, args)
                 if decision == PolicyDecision.DENY:
                     log.warning(f"DENY: {name} — {reason}")
-                    tool_results.append({
-                        "role": "tool",
-                        "content": f"[ZABLOKOWANE] {reason}",
-                        "name": name
-                    })
+                    tool_results.append(make_tool_result(
+                        name, f"[ZABLOKOWANE] {reason}", source="policy_deny",
+                    ))
                     continue
 
                 if decision == PolicyDecision.ASK:
                     # w trybie worker — skip ASK (bezpieczniej)
                     log.warning(f"SKIP (wymaga potwierdzenia): {name} — {reason}")
-                    tool_results.append({
-                        "role": "tool",
-                        "content": f"[POMINIĘTE — wymaga ręcznego potwierdzenia] {reason}",
-                        "name": name
-                    })
+                    tool_results.append(make_tool_result(
+                        name, f"[POMINIĘTE — wymaga ręcznego potwierdzenia] {reason}",
+                        source="policy_ask_skip",
+                    ))
                     continue
 
                 # Execute
@@ -302,14 +298,10 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
                     if action == "retry":
                         result = execute_tool(name, args)
 
-                # R7/P1: wrap_tool_output fences the autonomous path the
-                # same way web.py does for the interactive one. Name was
-                # already validated at the top of the loop (R9/N2).
-                tool_results.append({
-                    "role": "tool",
-                    "content": wrap_tool_output(name, result),
-                    "name": name,
-                })
+                # R11/M1: make_tool_result wraps everything through the
+                # same nonce-container invariant — real output, DENY
+                # reasons, ASK skips alike.
+                tool_results.append(make_tool_result(name, result))
 
             messages.extend(tool_results)
 
