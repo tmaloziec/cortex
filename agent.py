@@ -1271,6 +1271,40 @@ def main():
                 except Exception as e:
                     print(f"  {C.AMBER}Plugin {mode} activate warning: {e}{C.RESET}")
 
+            # R13/C5 (red team round 5): register on_deactivate with
+            # atexit + signal handlers so plugin cleanup runs on more
+            # exit paths than just the main()-loop finally block.
+            # Still best-effort (SIGKILL / OOM-kill cannot be caught),
+            # but covers normal exit, SIGINT, SIGTERM — which were the
+            # paths that previously leaked plugin-held resources in
+            # web/worker modes entirely (those never hit main()'s
+            # finally at all).
+            if hasattr(mod, "on_deactivate"):
+                import atexit as _atexit, signal as _signal
+                def _safe_deactivate(_mod=mod, _mode=mode):
+                    try:
+                        _mod.on_deactivate()
+                    except Exception as e:
+                        # Swallow — we're on a shutdown path.
+                        try:
+                            log.warning("plugin %s on_deactivate: %s", _mode, e)
+                        except Exception:
+                            pass
+                _atexit.register(_safe_deactivate)
+                # Chain a SIGTERM handler so `kill <pid>` triggers
+                # atexit instead of abrupt termination. Do not override
+                # if another handler is already set — sys.exit() will
+                # still trigger atexit in that case.
+                prev = _signal.getsignal(_signal.SIGTERM)
+                if prev in (_signal.SIG_DFL, _signal.SIG_IGN, None):
+                    def _sigterm(_sig, _frm, _prev=prev, _name=mode):
+                        try:
+                            log.info("SIGTERM in plugin mode %s — graceful exit", _name)
+                        except Exception:
+                            pass
+                        raise SystemExit(0)
+                    _signal.signal(_signal.SIGTERM, _sigterm)
+
             # get plugin prompt addition
             if hasattr(mod, "build_prompt"):
                 plugin_prompt_extra = mod.build_prompt("")
@@ -1303,33 +1337,16 @@ def main():
     def compact_fn(msgs):
         return compact_messages(msgs, OLLAMA_URL, OLLAMA_MODEL, keep_last=6, max_tokens=CONTEXT_MAX_TOKENS)
 
-    # R13/C2: wrap call_anthropic so every upload is WARN-logged with
-    # message count + byte count, and so tool-output containers can
-    # optionally be stripped before leaving the host.
-    def _fallback_anthropic_logged(messages: list, *a, **kw):
-        import re as _re
-        payload = messages
-        if FALLBACK_REDACT_TOOL_OUTPUTS:
-            payload = []
-            tag_re = _re.compile(
-                r"<(tool_output|compacted_history|external_briefing|worker_task)_[A-Za-z0-9_-]+"
-                r"[^>]*>.*?</\1_[A-Za-z0-9_-]+>",
-                _re.DOTALL,
-            )
-            for m in messages:
-                c = m.get("content", "")
-                if isinstance(c, str):
-                    c = tag_re.sub("[REDACTED untrusted container]", c)
-                payload.append({**m, "content": c})
-        total_chars = sum(len(m.get("content", "") or "") for m in payload)
-        log.warning(
-            "fallback: uploading %d messages / %d chars to api.anthropic.com "
-            "(CORTEX_FALLBACK_ANTHROPIC=1; redact=%s)",
-            len(payload), total_chars, "on" if FALLBACK_REDACT_TOOL_OUTPUTS else "off",
-        )
-        return call_anthropic(payload, *a, **kw)
-
-    fallback_fn = _fallback_anthropic_logged if FALLBACK_ANTHROPIC_ENABLED else None
+    # R13/C2 + R14: fallback policy lives in security.fallback now. The
+    # class encapsulates the opt-in flag, WARN logging, and optional
+    # redaction in one place. Passing it here is the only way to wire
+    # the fallback — the invariant test fails any PR that bypasses
+    # FallbackPolicy.from_env and goes directly to call_anthropic.
+    from security import FallbackPolicy as _FallbackPolicy
+    fallback_fn = _FallbackPolicy.from_env(
+        anthropic_key=ANTHROPIC_KEY,
+        call_fn=call_anthropic,
+    ).as_recovery_callable()
     recovery = RecoveryEngine(
         fallback_fn=fallback_fn,
         compact_fn=compact_fn,
@@ -1367,9 +1384,22 @@ def main():
     def _full_prompt(b: str = "") -> str:
         base = build_system_prompt(b, "")
         if ACTIVE_PLUGIN and plugin_prompt_extra:
+            # R13/C4 (red team round 5): plugin-authored prompt is now
+            # wrapped in an untrusted container with a per-call nonce,
+            # exactly like tool output and briefings. Previously the
+            # plugin text sat in the authoritative system role with only
+            # an appended reminder — a 500-word adversarial plugin
+            # prompt could dilute the 2-sentence reminder. Wrapping it
+            # removes the "trust sandwich" ambiguity: the model sees
+            # <plugin_guidance_<nonce> untrusted="true">...</...> inside
+            # the system message and rule #13 already enumerates
+            # plugin_guidance as an untrusted KIND.
+            wrapped_plugin = wrap_untrusted("plugin_guidance",
+                                             plugin_prompt_extra,
+                                             plugin=str(ACTIVE_PLUGIN))
             return (
                 f"{base}\n\n# Plugin: {ACTIVE_PLUGIN}\n"
-                f"{plugin_prompt_extra}"
+                f"{wrapped_plugin}"
                 f"{_PLUGIN_RULE_REMINDER}"
             )
         return base

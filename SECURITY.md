@@ -857,6 +857,99 @@ actioned.
   laundering shape R6/F1 fixed in the compactor. Rewritten as a
   `role=user` metadata note.
 
+### v1.0.8-rc1 — R13: structure-level invariant enforcement
+
+Rounds R1 through R12 each closed one finding and passed review,
+only for the next round to find a variant of the same bug in a
+different call site. Red team round 5 (R13) named the meta-pattern:
+**invariant as a property of the data structure survives; invariant
+as a property of a specific code path does not.**
+
+R13 acts on that diagnosis. Every invariant that used to be
+enforced by developer discipline is now enforced by the type of
+helper a caller must use, backed by CI tests that fail any PR that
+bypasses the helper.
+
+**Package: `security/`** — single source of truth for message
+construction, auth, session management, client-IP derivation,
+path normalisation, and Anthropic-fallback policy. No back-edges
+into `agent.py` / `web.py` / `worker.py`, so the import graph has
+no cycles.
+
+Modules:
+- `security.messages` — `wrap_untrusted`, `make_message`,
+  `make_tool_result`, `make_system_note`, `make_user_note`. Every
+  conversation message goes through one of these. Bare dict
+  literals banned outside `security/` by AST test.
+- `security.auth` — `ClientIdentity.from_request` (the only way
+  to derive a client IP, with trust-flag-gated proxy headers
+  True-Client-IP/CF-Connecting-IP/X-Real-IP), `SessionManager`
+  (mint/check/revoke cookie sessions + per-session rate limit +
+  master-token rate limit on authenticated traffic), `rate_limit_key`
+  (IPv6 /64 collapse, zone-id strip, IPv4-mapped fallback),
+  `build_require_auth` (the FastAPI dependency every authenticated
+  route declares).
+- `security.paths` — `normalize_path`, `path_under` (shared between
+  policy engine and tool executor).
+- `security.fallback` — `FallbackPolicy.from_env` encapsulates the
+  "is Anthropic upload allowed on Ollama ConnectionError" decision,
+  including the opt-in flag (`CORTEX_FALLBACK_ANTHROPIC=1`), WARN
+  logging, and redaction option (`CORTEX_FALLBACK_REDACT_TOOL_
+  OUTPUTS=1`). Mere presence of `ANTHROPIC_API_KEY` no longer
+  silently enables upload-on-transient-error.
+
+**Tests: `tests/test_invariants.py`** (AST walker, not regex):
+
+1. **No bare `role=...` dict literals** outside `security/` — all
+   conversation messages go through `make_message` (or thin
+   wrappers). Catches multi-line dicts, `dict(role=...)` form,
+   and every other shape regex would miss.
+2. **Every `@app.<verb>` / `@app.websocket` declares `Depends(
+   require_auth)` or `Depends(public_endpoint)`** — forgetting the
+   dependency on a new endpoint fails CI immediately.
+3. **No direct `request.client.host` access** — client IPs come
+   from `ClientIdentity.from_request` only.
+4. **No bare `fallback_fn = call_anthropic if ANTHROPIC_KEY`
+   wiring** — goes through `FallbackPolicy.from_env`.
+
+Escape hatch: per-line `# invariant: allow-<rule-id> because
+<reason>` comment. Visible to reviewers; every occurrence carries
+a one-sentence justification. Tested exemptions: CS agent
+registration payload (not LLM role), compactor's local-summariser
+API call (separate model call, not main history), `tool_calls`
+field on model-authored assistant turns (non-content field).
+
+**CODEOWNERS** covers `security/`, `tests/test_invariants.py`,
+`SECURITY.md`, and `requirements.txt`. Relaxing an invariant — or
+adding a new KIND to the untrusted-ingress set — requires sign-off.
+
+### R13 phase-2: semantic features the refactor surfaced
+
+Three red-team-round-5 findings were *features*, not invariants,
+so they landed alongside but separate from the structural refactor:
+
+- **C4 plugin prompt untrusted container.** Plugin-authored prompt
+  was previously appended to the system message as authoritative
+  text with a safety reminder sandwiched after. A 500-word
+  adversarial plugin prompt could still dilute the reminder for
+  weak models (gemma4:e4b). Plugin prompt now wraps through
+  `wrap_untrusted("plugin_guidance", …)` with a per-call nonce;
+  rule #13 already enumerated `plugin_guidance` as an untrusted
+  KIND.
+- **C5 `on_deactivate` lifecycle.** Plugin cleanup previously ran
+  only in CLI mode's main-loop `finally`. Web and worker modes
+  leaked plugin-held resources (threads, sockets, subprocesses).
+  Registration now happens via `atexit.register` at plugin-activate
+  time plus a SIGTERM handler that raises SystemExit to trigger
+  atexit — normal exit, `Ctrl-C`, and `kill <pid>` all fire
+  deactivate. `SIGKILL` / OOM-kill remain best-effort as before
+  (kernel denies userland any pre-death hook).
+- **C7 WebSocket re-auth between tool iterations.** R11/M4 added
+  per-inbound-message re-auth; R13/C7 adds per-tool-iteration
+  re-auth. A session revoked mid-turn (operator hits `/api/logout`
+  from another device, or `WEB_TOKEN` is rotated) now stops the
+  agent loop within one tool call rather than at end-of-turn.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection

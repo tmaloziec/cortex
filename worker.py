@@ -413,34 +413,14 @@ def main():
 {C.BLUE}+======================================================+{C.RESET}
 """)
 
-    # Init modules (call_anthropic imported at module top)
-    # R13/C2: same opt-in as interactive agent — ANTHROPIC_API_KEY alone
-    # is insufficient; require CORTEX_FALLBACK_ANTHROPIC=1 to enable
-    # the silent-upload path on ConnectionError.
-    def _fallback_logged(messages):
-        import re as _re
-        payload = messages
-        if FALLBACK_REDACT_TOOL_OUTPUTS:
-            tag_re = _re.compile(
-                r"<(tool_output|compacted_history|external_briefing|worker_task)_[A-Za-z0-9_-]+"
-                r"[^>]*>.*?</\1_[A-Za-z0-9_-]+>",
-                _re.DOTALL,
-            )
-            payload = [
-                {**m, "content": tag_re.sub("[REDACTED untrusted container]",
-                                            m.get("content", "") or "")}
-                for m in messages
-            ]
-        total_chars = sum(len(m.get("content", "") or "") for m in payload)
-        log.warning(
-            "worker fallback: uploading %d messages / %d chars to api.anthropic.com",
-            len(payload), total_chars,
-        )
-        return call_anthropic(payload)
-
+    # R13/C2 + R14: fallback policy via security.fallback (see agent.py).
+    from security import FallbackPolicy as _FallbackPolicy
     policy = PolicyEngine()
     recovery = RecoveryEngine(
-        fallback_fn=_fallback_logged if FALLBACK_ANTHROPIC_ENABLED else None,
+        fallback_fn=_FallbackPolicy.from_env(
+            anthropic_key=ANTHROPIC_KEY,
+            call_fn=call_anthropic,
+        ).as_recovery_callable(),
         compact_fn=lambda msgs: compact_messages(
             msgs, OLLAMA_URL, OLLAMA_MODEL, keep_last=6, max_tokens=CONTEXT_MAX_TOKENS
         )

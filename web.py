@@ -1974,6 +1974,29 @@ async def ws_endpoint(ws: WebSocket,
             while loop_count < _agent.MAX_TOOL_LOOPS:
                 loop_count += 1
 
+                # R13/C7 (red team round 5): re-check the authenticating
+                # credential between tool iterations. The per-inbound-
+                # message check (R11/M4) closed the "stolen cookie
+                # opens a socket" window; the per-tool-iteration check
+                # closes the "stolen cookie opens a socket, then one
+                # user request spawns 10 bash calls" window. A revoke
+                # mid-turn (operator hits /api/logout from another
+                # browser, or WEB_TOKEN was rotated) now stops the
+                # agent within one tool call, not at end-of-turn.
+                if AUTH_TOKEN:
+                    if ws_auth_cookie:
+                        _ok = _check_session_cookie(ws_auth_cookie)
+                    elif ws_auth_token:
+                        _ok = _check_auth(ws_auth_token)
+                    else:
+                        _ok = False
+                    if not _ok:
+                        stop_event.set()
+                        await ws.send_json({"type": "error",
+                                            "content": "Session expired mid-turn"})
+                        error_sent = True
+                        break
+
                 # context compression
                 if should_compact(messages, _agent.CONTEXT_MAX_TOKENS):
                     messages = compact_messages(
