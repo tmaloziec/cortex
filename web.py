@@ -158,6 +158,51 @@ def _check_auth(token: str) -> bool:
 # cookies, rotation) can change one without touching the other.
 AUTH_COOKIE_NAME = "cortex_session"
 
+# R8/T1: cookie no longer carries the master AUTH_TOKEN. After a successful
+# bootstrap, we mint a fresh per-session id and map it here to an expiry.
+# Leaking a cookie now leaks one session, not the master key; revocation
+# is a dict.pop() away; cookie expiry is authoritative (not cosmetic).
+_SESSION_TTL_SEC = 60 * 60 * 8    # 8h — matches cookie max_age
+_SESSION_LIMIT   = 64             # hard cap on live sessions per process
+_sessions: dict[str, float] = {}  # session_id -> monotonic expiry time
+_sessions_lock = threading.Lock()
+
+def _mint_session() -> str:
+    """Create a new session id, register it, return it. Caller sets the
+    id as the cookie value."""
+    import time as _time
+    sid = secrets.token_urlsafe(32)
+    expiry = _time.monotonic() + _SESSION_TTL_SEC
+    with _sessions_lock:
+        # Cap + opportunistic GC so a replay-spammer can't grow the dict.
+        now = _time.monotonic()
+        if len(_sessions) >= _SESSION_LIMIT:
+            expired = [k for k, v in _sessions.items() if v < now]
+            for k in expired:
+                _sessions.pop(k, None)
+            if len(_sessions) >= _SESSION_LIMIT:
+                # Drop the oldest to make room — prevents the cap from
+                # being used as a lockout vector.
+                oldest = min(_sessions.items(), key=lambda kv: kv[1])[0]
+                _sessions.pop(oldest, None)
+        _sessions[sid] = expiry
+    return sid
+
+def _check_session_cookie(sid: str) -> bool:
+    """Constant-time lookup of session id against live sessions. Returns
+    True if the id is known and not expired."""
+    if not sid:
+        return False
+    import time as _time
+    with _sessions_lock:
+        expiry = _sessions.get(sid)
+        if expiry is None:
+            return False
+        if expiry < _time.monotonic():
+            _sessions.pop(sid, None)
+            return False
+    return True
+
 # Trust reverse-proxy X-Forwarded-Proto when deciding whether the client
 # connection was HTTPS. Opt-in: blindly trusting forwarded headers lets a
 # LAN attacker who can reach uvicorn directly spoof "https" and harvest
@@ -217,14 +262,17 @@ def _is_request_https(request) -> bool:
 
 def _require_auth(authorization: str = None, x_token: str = None,
                   query_token: str = None, cookie_token: str = None):
-    """Extract token from cookie, Authorization header, X-Token header, or
-    ?token= query (in that order). Cookie is preferred so the bootstrap URL
-    token can be exchanged for an HttpOnly cookie after first load — red team
-    #6 flagged long-lived ?token= in Referer / browser history / shared URLs."""
+    """Authenticate using (in preference order): cookie session id,
+    Authorization header, X-Token header, ?token= query.
+
+    R8/T1: cookie path verifies against the server-side session table
+    (`_check_session_cookie`), not the master `AUTH_TOKEN`. Only the
+    header/query fallbacks use the master token (for CLI / curl / tests
+    — those clients do their own long-lived auth)."""
+    if cookie_token and _check_session_cookie(cookie_token):
+        return
     token = ""
-    if cookie_token:
-        token = cookie_token
-    elif authorization and authorization.startswith("Bearer "):
+    if authorization and authorization.startswith("Bearer "):
         token = authorization[7:]
     elif x_token:
         token = x_token
@@ -1536,22 +1584,23 @@ async def root(request: Request,
     # Auth disabled? Serve HTML straight. Covers localhost + WEB_INSECURE=1.
     if not AUTH_TOKEN:
         return HTMLResponse(HTML)
-    # Cookie already carries a valid session — no token exchange needed.
-    if cortex_session and _check_auth(cortex_session):
+    # Cookie carries a session id (R8/T1) — verify against the session table.
+    if cortex_session and _check_session_cookie(cortex_session):
         return HTMLResponse(HTML)
     # R7/P4: guard the bootstrap path before validating so an attacker
     # who pounds /?token=<guess> can't probe at wire speed.
     ip = _client_ip(request)
     # Bootstrap flow: first load with ?token=... from the terminal link.
-    # Validate, set HttpOnly cookie, and redirect to a clean "/" so the URL
-    # in the address bar / browser history / Referer header no longer
-    # carries the long-lived token (red team #6).
+    # Validate, mint a session id, set HttpOnly cookie with that id,
+    # redirect to a clean "/" so the URL in the address bar / history /
+    # Referer header no longer carries the long-lived master token.
     if token and _check_auth(token):
         is_https = _is_request_https(request)
+        session_id = _mint_session()
         resp = RedirectResponse(url="/", status_code=303)
         resp.set_cookie(
             key=AUTH_COOKIE_NAME,
-            value=token,
+            value=session_id,
             httponly=True,            # JS can't read it — XSS can't exfil
             secure=is_https,          # only over TLS when TLS is in play
             samesite="strict",        # CSRF: no cross-site submissions
@@ -1577,12 +1626,13 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
     if AUTH_TOKEN and origin and origin not in _ALLOWED_ORIGINS:
         await ws.close(code=4403)
         return
-    # Auth: prefer HttpOnly cookie (browsers attach it automatically to the
-    # WS handshake same-origin), fall back to ?token= for CLI clients and
-    # the first-ever connection before the bootstrap redirect has run.
+    # Auth: prefer HttpOnly cookie (browser attached it to the WS
+    # handshake); fall back to ?token= for CLI clients. R8/T1: cookie
+    # carries a session id checked against the in-memory session table;
+    # ?token= is still the master AUTH_TOKEN (CLI harness convention).
     cookie_token = ws.cookies.get(AUTH_COOKIE_NAME, "") if hasattr(ws, "cookies") else ""
-    auth_value = cookie_token or token
-    if not _check_auth(auth_value):
+    authed = (cookie_token and _check_session_cookie(cookie_token)) or _check_auth(token)
+    if not authed:
         # R7/P4: same rate-limit bucket as HTTP bootstrap. Close with
         # 4429 when tripped so the client can distinguish rate-limit
         # from regular auth failure.
@@ -2067,6 +2117,22 @@ if __name__ == "__main__":
         print("  This would expose unauthenticated agent control to the network.")
         print("  Either set WEB_TOKEN, bind to 127.0.0.1, or set WEB_INSECURE=1 to override.")
         sys.exit(2)
+
+    # R8/T2: warn when the operator has broadened WEB_ORIGIN_ALLOWLIST (i.e.
+    # is running behind a reverse proxy / Cloudflare Tunnel / Tailscale
+    # Funnel) but has NOT set CORTEX_TRUST_PROXY_HEADERS=1. Without that
+    # flag, uvicorn sees http:// on the internal leg and emits the session
+    # cookie without the Secure attribute — the cookie will be replayed
+    # over plain HTTP if the proxy ever downgrades.
+    _extra_origins_set = bool(os.getenv("WEB_ORIGIN_ALLOWLIST"))
+    if AUTH_TOKEN and _extra_origins_set and not TRUST_PROXY_HEADERS:
+        print()
+        print("WARNING: WEB_ORIGIN_ALLOWLIST is set (reverse proxy suspected) but")
+        print("  CORTEX_TRUST_PROXY_HEADERS=1 is NOT. The session cookie's Secure")
+        print("  flag will be decided from the internal uvicorn leg (likely http)")
+        print("  and may not be set. Set CORTEX_TRUST_PROXY_HEADERS=1 if the proxy")
+        print("  is trusted, or terminate TLS at uvicorn directly.")
+        print()
 
     base_url = f"http://{WEB_HOST}:{WEB_PORT}"
     if AUTH_TOKEN:

@@ -213,8 +213,13 @@ DEFAULT_POLICIES = {
         r"\.config/pip/pip\.conf$", r"(^|/)pip\.conf$", r"\.pip/pip\.conf$",
         r"\.npmrc$", r"\.pypirc$",
         # Cortex's own plugin directory: importlib-loaded at startup =
-        # persistent RCE on next `python agent.py`.
-        r"(^|/)plugins/.*\.py$",
+        # persistent RCE on next `python agent.py`. Use a non-word
+        # lookahead instead of `$` so the pattern hits inside a bash
+        # command string where the path is followed by whitespace or a
+        # redirection, not only when the whole string ends at .py
+        # (R8/E1 hardening — `tee plugins/x.py < payload` slipped past
+        # the old $-anchored form).
+        r"(^|/)plugins/.*\.py(?!\w)",
     ],
 
     # Anything holding a live credential should be off-limits to both read
