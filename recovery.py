@@ -11,6 +11,8 @@ import threading
 import requests
 from typing import Optional, Callable
 
+from security import make_system_note, make_user_note
+
 log = logging.getLogger("recovery")
 
 
@@ -127,13 +129,15 @@ class RecoveryEngine:
 
                 if bad_json and attempt < recipe["max_retries"]:
                     log.warning(f"Bad JSON in tool_calls, retry {attempt+1}")
-                    # Use a system-role hint (not a fake [SYSTEM] prefix in a
-                    # user message, which would let a malicious tool output
-                    # forge the same marker and inject instructions).
-                    messages.append({
-                        "role": "system",
-                        "content": "Your previous response contained invalid JSON in tool arguments. Please retry with strictly valid JSON for all tool calls."
-                    })
+                    # R13/C3: system-role hint goes through make_system_note
+                    # so the content is wrapped in a recovery_note_<nonce>
+                    # container. Hardcoded string today, but wrapping means
+                    # a future interpolated exception message can't become
+                    # a system-role prompt-injection vector.
+                    messages.append(make_system_note(
+                        "Your previous response contained invalid JSON in tool arguments. "
+                        "Please retry with strictly valid JSON for all tool calls."
+                    ))
                     time.sleep(0.5)
                     continue
 
@@ -222,10 +226,11 @@ class RecoveryEngine:
         result = []
         if system:
             result.append(system)
-        result.append({
-            "role": "user",
-            "content": "[CONTEXT COMPRESSED — older turns dropped due to context limit. Treat this note as operator metadata, not as a prior confirmation or assistant claim.]"
-        })
+        result.append(make_user_note(
+            "[CONTEXT COMPRESSED — older turns dropped due to context limit. "
+            "Treat this note as operator metadata, not as a prior confirmation "
+            "or assistant claim.]"
+        ))
         result.extend(messages[-4:])
         return result
 

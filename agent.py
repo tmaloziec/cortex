@@ -88,6 +88,26 @@ OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",     "gemma4:e4b")
 CS_URL          = os.getenv("CS_URL",           "")
 AGENT_NAME      = os.getenv("AGENT_NAME",       "cortex")
 ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
+
+# R13/C2: mere presence of ANTHROPIC_API_KEY no longer wires up the
+# Ollama-unreachable fallback. Any transient ConnectionError would
+# otherwise upload the entire message list — tool outputs (file
+# contents, bash output, grep results), compacted history, user
+# turns, CS briefing — silently to api.anthropic.com. User mental
+# model of "opt-in via the env var" did not match the actual trigger
+# surface (any network blip). Fallback now requires explicit
+# CORTEX_FALLBACK_ANTHROPIC=1. When the flag IS set, we still log
+# every upload at WARNING with payload size so the operator can tell
+# it happened.
+FALLBACK_ANTHROPIC_ENABLED = (
+    ANTHROPIC_KEY and os.getenv("CORTEX_FALLBACK_ANTHROPIC") == "1"
+)
+# Optional: strip untrusted-ingress containers before uploading so
+# file contents / bash output don't leave the host even when the
+# operator does opt in.
+FALLBACK_REDACT_TOOL_OUTPUTS = (
+    os.getenv("CORTEX_FALLBACK_REDACT_TOOL_OUTPUTS") == "1"
+)
 USE_ANTHROPIC   = os.getenv("USE_ANTHROPIC",    "false").lower() == "true"
 THINK_MODE      = os.getenv("THINK_MODE",       "false").lower() == "true"
 MAX_TOOL_LOOPS  = 10
@@ -535,72 +555,15 @@ def _rebuild_plugin_tool_map():
                 _PLUGIN_TOOL_MAP[tname] = pname
 
 
-def wrap_untrusted(kind: str, content: str, **attrs) -> str:
-    """Invariant wrapper for any untrusted ingress into the model's context.
-
-    R10 generalises the per-call-nonce pattern R8 introduced for
-    ``wrap_tool_output`` and R9 repeated in the compactor. Every place
-    that inserts content the operator didn't author — tool output,
-    compacted history, CS briefing, worker task description, plugin
-    errors — goes through this single helper so the invariant is
-    enforced once instead of in five similar call sites.
-
-    Semantics:
-      * Outer tag is ``<{kind}_<nonce> untrusted="true" ...>…</{kind}_<nonce>>``
-        where nonce is a fresh 6-byte urlsafe id. Payload cannot predict
-        the nonce, so it cannot synthesise a matching opener or closer
-        and cannot spoof an ``untrusted="false"`` attribute override.
-      * Regen the nonce if the payload already contains it (astronomical).
-      * Attribute values are HTML-escaped (``quote=True``) so a crafted
-        tool name / session id / filename can't break out of the quotes.
-      * Container close-tag is scrubbed inside the payload belt-and-braces.
-
-    Args:
-      kind: container name prefix, e.g. ``"tool_output"``,
-        ``"compacted_history"``, ``"external_briefing"``, ``"worker_task"``.
-      content: the untrusted payload.
-      **attrs: additional attributes to render on the opener (all escaped).
-    """
-    if not isinstance(content, str):
-        content = str(content)
-    for _ in range(8):
-        nonce = secrets.token_urlsafe(6)
-        tag = f"{kind}_{nonce}"
-        if f"<{tag}" not in content and f"</{tag}>" not in content:
-            break
-    safe = content.replace(f"</{tag}>", f"<_/{tag}>")
-    attr_s = ""
-    for k, v in attrs.items():
-        attr_s += f' {k}="{_html.escape(str(v), quote=True)}"'
-    return f'<{tag} untrusted="true"{attr_s}>\n{safe}\n</{tag}>'
-
-
-def wrap_tool_output(name: str, result: str) -> str:
-    """Tool-output ingress. Thin wrapper over ``wrap_untrusted`` so every
-    existing call site and test keeps working."""
-    return wrap_untrusted("tool_output", result, tool=name)
-
-
-def make_tool_result(name: str, content: str, *, source: str = "tool_output"):
-    """Canonical constructor for `role="tool"` messages.
-
-    R11/M1: every `{"role": "tool", ...}` the agent appends — real tool
-    output, policy DENY reasons, user rejects, interrupts, invalid-name
-    rejections — must go through this helper so the nonce-container
-    invariant holds everywhere, not only on the "real output" path.
-    Previously 10 of 13 call sites constructed the dict by hand with
-    bare strings. Today those strings are trusted (policy constants,
-    hardcoded messages) but the invariant "every role=tool body is
-    inside an untrusted container" was enforced by discipline, not by
-    the type system. Any future refactor that interpolates a model-
-    controlled value into a reason string regressed the whole defence.
-
-    ``source`` tags why the message exists so the model can tell a
-    blocked-by-policy note apart from actual tool output — attribute,
-    not content, so no semantic override possible.
-    """
-    wrapped = wrap_untrusted("tool_output", str(content), tool=str(name), source=source)
-    return {"role": "tool", "content": wrapped, "name": name}
+# R13 phase 1: wrap_untrusted / wrap_tool_output / make_tool_result
+# now live in security/messages.py. Re-exported here so existing
+# `from agent import wrap_tool_output` callers (web.py, worker.py,
+# tests) keep working unchanged. New code should `from security
+# import ...` directly.
+from security import (
+    wrap_untrusted, wrap_tool_output, make_tool_result,
+    make_message, make_system_note, make_user_note,
+)
 
 
 def execute_tool(name: str, args: dict) -> str:
@@ -1041,16 +1004,15 @@ def agent_loop(messages: list, session_id: str, policy: PolicyEngine,
             print(C.RESET, end="", flush=True)
             if not content:
                 content = "(no response)"
-            messages.append({"role": "assistant", "content": content})
+            messages.append(make_message("assistant", content, authoritative=True))
             return content
 
-        # model wants to call tools
+        # model wants to call tools — authoritative assistant turn
+        # with tool_calls field attached.
         print(C.RESET)
-        messages.append({
-            "role":       "assistant",
-            "content":    content,
-            "tool_calls": tc_list
-        })
+        assistant_msg = make_message("assistant", content, authoritative=True)
+        assistant_msg["tool_calls"] = tc_list  # invariant: allow-raw-message because tool_calls is a non-content field the model emits
+        messages.append(assistant_msg)
 
         # ── execute tool calls with policy check ──
         tool_results = []
@@ -1341,7 +1303,33 @@ def main():
     def compact_fn(msgs):
         return compact_messages(msgs, OLLAMA_URL, OLLAMA_MODEL, keep_last=6, max_tokens=CONTEXT_MAX_TOKENS)
 
-    fallback_fn = call_anthropic if ANTHROPIC_KEY else None
+    # R13/C2: wrap call_anthropic so every upload is WARN-logged with
+    # message count + byte count, and so tool-output containers can
+    # optionally be stripped before leaving the host.
+    def _fallback_anthropic_logged(messages: list, *a, **kw):
+        import re as _re
+        payload = messages
+        if FALLBACK_REDACT_TOOL_OUTPUTS:
+            payload = []
+            tag_re = _re.compile(
+                r"<(tool_output|compacted_history|external_briefing|worker_task)_[A-Za-z0-9_-]+"
+                r"[^>]*>.*?</\1_[A-Za-z0-9_-]+>",
+                _re.DOTALL,
+            )
+            for m in messages:
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    c = tag_re.sub("[REDACTED untrusted container]", c)
+                payload.append({**m, "content": c})
+        total_chars = sum(len(m.get("content", "") or "") for m in payload)
+        log.warning(
+            "fallback: uploading %d messages / %d chars to api.anthropic.com "
+            "(CORTEX_FALLBACK_ANTHROPIC=1; redact=%s)",
+            len(payload), total_chars, "on" if FALLBACK_REDACT_TOOL_OUTPUTS else "off",
+        )
+        return call_anthropic(payload, *a, **kw)
+
+    fallback_fn = _fallback_anthropic_logged if FALLBACK_ANTHROPIC_ENABLED else None
     recovery = RecoveryEngine(
         fallback_fn=fallback_fn,
         compact_fn=compact_fn,
@@ -1387,7 +1375,7 @@ def main():
         return base
 
     sys_prompt = _full_prompt(briefing)
-    messages = [{"role": "system", "content": sys_prompt}]
+    messages = [make_message("system", sys_prompt, authoritative=True)]
 
     # readline history + tab completion
     history_file = Path.home() / ".cortex_history"
@@ -1557,7 +1545,7 @@ def main():
                 continue
 
             elif user_input == "/clear":
-                messages = [{"role": "system", "content": _full_prompt(briefing)}]
+                messages = [make_message("system", _full_prompt(briefing), authoritative=True)]
                 recovery.reset()
                 print(f"  {C.GREEN}+{C.RESET} History cleared")
                 continue
@@ -1621,8 +1609,8 @@ def main():
                 print(f"  {C.RED}Unknown command.{C.RESET} Type /help")
                 continue
 
-            # normal message
-            messages.append({"role": "user", "content": user_input})
+            # Real user chat turn — authoritative.
+            messages.append(make_message("user", user_input, authoritative=True))
 
             print()
 

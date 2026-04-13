@@ -20,7 +20,7 @@ import subprocess
 import asyncio
 from pathlib import Path
 from urllib.parse import urlparse
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Query, Cookie, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Query, Cookie, Request, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 import uvicorn
 
@@ -415,6 +415,24 @@ def _require_auth(request=None, authorization: str = None, x_token: str = None,
     raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 app = FastAPI(title="Cortex")
+
+# R13: wire the security-package require_auth dependency. Every
+# authenticated @app route declares `auth: ... = Depends(_require_auth)`.
+# The invariant test (tests/test_invariants.py #2) walks the AST of
+# every @app.<verb> / @app.websocket and fails if the Depends is
+# missing — so forgetting the guard on a new endpoint can't ship.
+from security import (
+    SessionManager as _SessionManager,
+    build_require_auth as _build_require_auth,
+    public_endpoint as _public_endpoint,
+    ClientIdentity as _ClientIdentity,
+)
+_session_manager = _SessionManager()
+_require_auth_dep = _build_require_auth(
+    master_token=AUTH_TOKEN,
+    sessions=_session_manager,
+    trust_proxy=TRUST_PROXY_HEADERS,
+)
 
 # ─── SECURITY HEADERS ─────────────────────────────────────────────────────────
 # Single-file UI: styles and the whole agent script live inline in the HTML.
@@ -1713,7 +1731,12 @@ _recovery = RecoveryEngine(
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request,
                token: str = Query(default=""),
-               cortex_session: str = Cookie(default="")):
+               cortex_session: str = Cookie(default=""),
+               _pub=Depends(_public_endpoint)):
+    # Bootstrap endpoint handles its own auth flow (exchanges the URL
+    # ?token= for an HttpOnly session cookie). Marked public so the
+    # invariant test permits the custom handling; actual auth is
+    # performed inline below.
     # Auth disabled? Serve HTML straight. Covers localhost + WEB_INSECURE=1.
     if not AUTH_TOKEN:
         return HTMLResponse(HTML)
@@ -1751,7 +1774,11 @@ async def root(request: Request,
 
 @app.post("/api/logout")
 async def logout(request: Request,
-                 cortex_session: str = Cookie(default="")):
+                 cortex_session: str = Cookie(default=""),
+                 _pub=Depends(_public_endpoint)):
+    # Unauthenticated on purpose — user logging out of an expired/
+    # revoked session must still be able to clear their cookie. The
+    # session table lookup below is bounded and constant-time.
     """R10/#5: end the current session. Removes the session id from the
     in-memory table so a stolen cookie stops working immediately. No
     auth required beyond presenting a cookie — unauthenticated POSTs
@@ -1765,7 +1792,13 @@ async def logout(request: Request,
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
+async def ws_endpoint(ws: WebSocket,
+                     token: str = Query(default=""),
+                     _pub=Depends(_public_endpoint)):
+    # Marked public because FastAPI Depends doesn't fire on websocket
+    # routes the same way (no HTTPException path). Auth happens
+    # explicitly below via cookie check + _check_auth master-token
+    # fallback, plus per-message re-auth in the main loop (R11/M4).
     # CSRF protection: validate Origin header. Browsers always send Origin
     # for cross-origin WebSocket attempts, so a missing Origin is a signal
     # of a non-browser client (CLI harness, tests) — let those through on
@@ -1808,7 +1841,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
 
     briefing = get_briefing()
     session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    messages   = [{"role": "system", "content": build_system_prompt(briefing)}]
+    messages   = [_agent.make_message("system", build_system_prompt(briefing), authoritative=True)]
     stop_event = asyncio.Event()
 
     # sprawdź CS
@@ -1892,7 +1925,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                     break
 
             if data.get("type") == "clear":
-                messages = [{"role": "system", "content": build_system_prompt(get_briefing())}]
+                messages = [_agent.make_message("system", build_system_prompt(get_briefing()), authoritative=True)]
                 session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 await ws.send_json({"type": "session_id", "id": session_id})
                 continue
@@ -1902,7 +1935,7 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                 loaded = _load_session_local(old_id)
                 if loaded:
                     session_id = old_id
-                    messages = [{"role": "system", "content": build_system_prompt(get_briefing())}]
+                    messages = [_agent.make_message("system", build_system_prompt(get_briefing()), authoritative=True)]
                     # ogranicz do ostatnich 10 wiadomości żeby nie przeciążyć modelu
                     old_msgs = loaded.get("messages", [])
                     if len(old_msgs) > 10:
@@ -1931,7 +1964,8 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
                 })
                 user_text = user_text[:WS_MAX_MESSAGE_CHARS]
 
-            messages.append({"role": "user", "content": user_text})
+            # Real user chat turn — authoritative.
+            messages.append(_agent.make_message("user", user_text, authoritative=True))
             await ws.send_json({"type": "start"})
 
             # agent loop z WebSocket streaming
@@ -2029,23 +2063,28 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(default="")):
 
                 if error_sent or stopped:
                     if stopped and collected["content"]:
-                        messages.append({"role": "assistant", "content": collected["content"] + "\n[przerwano]"})
+                        # Partial assistant turn from a stop-button interrupt
+                        # — still authoritative (model actually produced it).
+                        messages.append(_agent.make_message(
+                            "assistant",
+                            collected["content"] + "\n[przerwano]",
+                            authoritative=True,
+                        ))
                     break
 
                 tool_calls = collected["tc"]
                 full_content = collected["content"]
 
                 if not tool_calls:
-                    # finalna odpowiedź
-                    messages.append({"role": "assistant", "content": full_content})
+                    # Final model response — authoritative.
+                    messages.append(_agent.make_message("assistant", full_content, authoritative=True))
                     break
 
-                # tool calls
-                messages.append({
-                    "role": "assistant",
-                    "content": full_content,
-                    "tool_calls": tool_calls
-                })
+                # Assistant turn with tool_calls — authoritative, with the
+                # tool_calls field attached post-construction (non-content).
+                _asst = _agent.make_message("assistant", full_content, authoritative=True)
+                _asst["tool_calls"] = tool_calls  # invariant: allow-raw-message because tool_calls is a non-content field the model emits
+                messages.append(_asst)
 
                 tool_results = []
                 for i, tc in enumerate(tool_calls):
@@ -2181,11 +2220,8 @@ def _model_fits(param_size_str: str, ram_gb: float) -> str:
 
 @app.get("/api/models")
 async def list_models(request: Request,
-                      authorization: str = Header(default=None),
-                      x_token: str = Header(default=None),
-                      cortex_session: str = Cookie(default="")):
+                      _auth=Depends(_require_auth_dep)):
     """List Ollama models with capabilities and compatibility info."""
-    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     ram_gb = _get_ram_gb()
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
@@ -2214,11 +2250,8 @@ async def list_models(request: Request,
 
 @app.post("/api/model")
 async def switch_model(request: Request, body: dict,
-                       authorization: str = Header(default=None),
-                       x_token: str = Header(default=None),
-                       cortex_session: str = Cookie(default="")):
+                       _auth=Depends(_require_auth_dep)):
     """Switch the active model. Validates against available Ollama models."""
-    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     global OLLAMA_MODEL
     new_model = body.get("model", "")
     if not new_model or not isinstance(new_model, str):
@@ -2238,20 +2271,14 @@ async def switch_model(request: Request, body: dict,
 
 @app.get("/api/sessions")
 async def list_sessions(request: Request,
-                        authorization: str = Header(default=None),
-                        x_token: str = Header(default=None),
-                        cortex_session: str = Cookie(default="")):
+                        _auth=Depends(_require_auth_dep)):
     """List saved sessions."""
-    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     return {"sessions": _list_sessions_local()}
 
 @app.get("/api/session/{session_id}")
 async def get_session(session_id: str, request: Request,
-                      authorization: str = Header(default=None),
-                      x_token: str = Header(default=None),
-                      cortex_session: str = Cookie(default="")):
+                      _auth=Depends(_require_auth_dep)):
     """Load a session."""
-    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session id format")
     data = _load_session_local(session_id)
@@ -2261,11 +2288,8 @@ async def get_session(session_id: str, request: Request,
 
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str, request: Request,
-                         authorization: str = Header(default=None),
-                         x_token: str = Header(default=None),
-                         cortex_session: str = Cookie(default="")):
+                         _auth=Depends(_require_auth_dep)):
     """Delete a session."""
-    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session id format")
     path = SESSIONS_DIR / f"{session_id}.json"
@@ -2275,7 +2299,7 @@ async def delete_session(session_id: str, request: Request,
     return {"ok": True}
 
 @app.get("/health")
-async def health():
+async def health(_pub=Depends(_public_endpoint)):
     """Public health check (no auth required). Returns only a liveness
     signal — model name, agent name, and auth state used to be returned
     here too, but that leaked recon info to unauthenticated callers."""

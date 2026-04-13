@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from agent import (
     execute_tool, call_model, call_anthropic, build_system_prompt,
     wrap_tool_output, make_tool_result, _valid_tool_name,
+    FALLBACK_ANTHROPIC_ENABLED, FALLBACK_REDACT_TOOL_OUTPUTS,
     TOOLS, OLLAMA_URL, OLLAMA_MODEL, CS_URL, ANTHROPIC_KEY,
     MAX_TOOL_LOOPS, CONTEXT_MAX_TOKENS, C
 )
@@ -79,7 +80,7 @@ def cs_register():
         r = requests.post(f"{CS_URL}/api/agents/register", json={
             "name": AGENT_NAME,
             "location": os.getenv("AGENT_LOCATION", "local"),
-            "role": "Cortex Agent",
+            "role": "Cortex Agent",  # invariant: allow-raw-message because CS agent registration payload, not LLM conversation role
             "capabilities": ["chat", "coding", "tasks", "bash", "files"]
         }, timeout=5)
         if r.ok:
@@ -193,13 +194,15 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
     # doesn't need to infer the convention from the fence text.
     system_prompt = build_system_prompt(briefing)
 
-    from agent import wrap_untrusted as _wrap_untrusted
+    from security import wrap_untrusted, make_message
     task_body = f"title: {title}\npriority: {priority}\n\n{description}"
-    user_task = _wrap_untrusted("worker_task", task_body, id=str(task_id))
+    user_task = wrap_untrusted("worker_task", task_body, id=str(task_id))
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_task}
+        make_message("system", system_prompt, authoritative=True),
+        # The user turn carries the already-wrapped worker_task body;
+        # authoritative=True because the wrapping is inside.
+        make_message("user", user_task, authoritative=True),
     ]
 
     # Agent loop
@@ -237,15 +240,16 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
 
             if not tc_list:
                 final_content = content or "(brak odpowiedzi)"
-                messages.append({"role": "assistant", "content": final_content})
+                # Real model-generated assistant turn — authoritative.
+                messages.append(make_message("assistant", final_content, authoritative=True))
                 break
 
-            # tool calls
-            messages.append({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tc_list
-            })
+            # Real model-generated assistant turn with tool_calls.
+            # authoritative=True; the tool results that follow are the
+            # untrusted part and go through make_tool_result separately.
+            assistant_msg = make_message("assistant", content, authoritative=True)
+            assistant_msg["tool_calls"] = tc_list  # invariant: allow-raw-message because tool_calls is a non-content field the model emits
+            messages.append(assistant_msg)
 
             tool_results = []
             for tc in tc_list:
@@ -410,9 +414,33 @@ def main():
 """)
 
     # Init modules (call_anthropic imported at module top)
+    # R13/C2: same opt-in as interactive agent — ANTHROPIC_API_KEY alone
+    # is insufficient; require CORTEX_FALLBACK_ANTHROPIC=1 to enable
+    # the silent-upload path on ConnectionError.
+    def _fallback_logged(messages):
+        import re as _re
+        payload = messages
+        if FALLBACK_REDACT_TOOL_OUTPUTS:
+            tag_re = _re.compile(
+                r"<(tool_output|compacted_history|external_briefing|worker_task)_[A-Za-z0-9_-]+"
+                r"[^>]*>.*?</\1_[A-Za-z0-9_-]+>",
+                _re.DOTALL,
+            )
+            payload = [
+                {**m, "content": tag_re.sub("[REDACTED untrusted container]",
+                                            m.get("content", "") or "")}
+                for m in messages
+            ]
+        total_chars = sum(len(m.get("content", "") or "") for m in payload)
+        log.warning(
+            "worker fallback: uploading %d messages / %d chars to api.anthropic.com",
+            len(payload), total_chars,
+        )
+        return call_anthropic(payload)
+
     policy = PolicyEngine()
     recovery = RecoveryEngine(
-        fallback_fn=call_anthropic if ANTHROPIC_KEY else None,
+        fallback_fn=_fallback_logged if FALLBACK_ANTHROPIC_ENABLED else None,
         compact_fn=lambda msgs: compact_messages(
             msgs, OLLAMA_URL, OLLAMA_MODEL, keep_last=6, max_tokens=CONTEXT_MAX_TOKENS
         )

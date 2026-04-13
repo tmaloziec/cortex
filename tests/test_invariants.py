@@ -44,10 +44,11 @@ _TARGET_FILES = (
     "policy.py",
 )
 
-# Phase flag. Set to True once every source file has been migrated
-# through security/*. Until then each test wraps its failures in an
-# xfail so the suite stays green during the migration.
-STRICT = False
+# Phase flag. Flipped to True after R13 phase-1 migration completed —
+# all source files now route through security/* and any regression
+# fails CI. A new ingress type / new endpoint that bypasses the
+# security/ helpers will fail one of the four tests below.
+STRICT = True
 
 
 def _targets():
@@ -63,6 +64,20 @@ def _allow_comment(line: str, rule_id: str) -> bool:
 
 def _line_of(src: str, node: ast.AST) -> str:
     return src.splitlines()[node.lineno - 1] if getattr(node, "lineno", 0) else ""
+
+
+def _any_line_of_node_has_allow(src: str, node: ast.AST, rule_id: str) -> bool:
+    """Allow-comment may live on any line spanned by the offending
+    node (dict literals can straddle several lines)."""
+    start = getattr(node, "lineno", 0) or 0
+    end = getattr(node, "end_lineno", start) or start
+    if not start:
+        return False
+    lines = src.splitlines()
+    for i in range(start - 1, min(end, len(lines))):
+        if _allow_comment(lines[i], rule_id):
+            return True
+    return False
 
 
 # ─── INVARIANT 1: bare role=<anything> dict literals outside security/ ───
@@ -103,7 +118,7 @@ def test_no_bare_role_dict_literals():
             if role_val is None:
                 continue
             line = _line_of(src, node)
-            if _allow_comment(line, "raw-message"):
+            if _any_line_of_node_has_allow(src, node, "raw-message"):
                 continue
             offenders.append(f"{fname}:{node.lineno} role={role_val!r}  {line.strip()[:120]}")
     _assert(offenders, "Bare role=<...> dicts found — use security.make_message or make_tool_result")
@@ -160,9 +175,15 @@ def test_every_route_has_auth_dependency():
     """Invariant #2: every ``@app.<verb>(...)`` / ``@app.websocket(...)``
     declares ``Depends(require_auth)`` or ``Depends(public_endpoint)``.
     Forgetting the dependency means the route ships open to the world.
+
+    The dependency reference is matched by *suffix* — any identifier
+    ending in ``require_auth`` / ``require_auth_dep`` / ``public_endpoint``
+    counts. This lets wiring code rename the bound callable without
+    rewriting the test (e.g. ``_require_auth_dep`` in web.py points at
+    the configured instance of ``security.auth.require_auth``).
     """
     offenders: list[str] = []
-    allowed_deps = {"require_auth", "public_endpoint"}
+    allowed_suffixes = ("require_auth", "require_auth_dep", "public_endpoint")
     for fname, src in _targets():
         try:
             tree = ast.parse(src)
@@ -174,7 +195,7 @@ def test_every_route_has_auth_dependency():
                 if not routes:
                     continue
                 deps = _function_auth_dependencies(node)
-                if allowed_deps & deps:
+                if any(d.endswith(suf) for d in deps for suf in allowed_suffixes):
                     continue
                 line = _line_of(src, node)
                 if _allow_comment(line, "unauth-endpoint"):
