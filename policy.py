@@ -220,6 +220,16 @@ DEFAULT_POLICIES = {
         # (R8/E1 hardening — `tee plugins/x.py < payload` slipped past
         # the old $-anchored form).
         r"(^|/)plugins/.*\.py(?!\w)",
+        # R9: writes to any loader-picked-up extension in plugins/ are
+        # equally persistent: .pth (site.py auto-loads at interpreter
+        # start), .so (compiled extension imported by spec_from_file_
+        # location fallback), .pyc (bytecode next to a .py with matching
+        # mtime can pre-empt the source). Block alongside .py.
+        r"(^|/)plugins/.*\.(pth|so|pyc)(?!\w)",
+        # .pth files are dangerous wherever site-packages imports them,
+        # not only inside plugins/. Extended beyond the original
+        # site-packages/*.pth entry.
+        r"(^|/)[^/]+\.pth(?!\w)",
     ],
 
     # Anything holding a live credential should be off-limits to both read

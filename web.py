@@ -217,32 +217,75 @@ TRUST_PROXY_HEADERS = os.getenv("CORTEX_TRUST_PROXY_HEADERS") == "1"
 # sliding window. Kept lightweight to avoid a slowapi dependency.
 _AUTH_FAIL_WINDOW_SEC = 60
 _AUTH_FAIL_LIMIT = 10
+_AUTH_FAIL_GC_THRESHOLD = 256  # R9: lowered from 1024 so IPv6 /64 spray is GC'd sooner
 _auth_fail_log: dict[str, list[float]] = {}
 _auth_fail_lock = threading.Lock()
+
+def _rate_limit_key(ip: str) -> str:
+    """Normalise an IP into the key used for rate-limit bucketing.
+
+    R9/#2: IPv6 `/128` keying is useless in the wild — consumer ISPs hand
+    out `/64` and a Linux client can `ip -6 route add local <prefix>::/64
+    dev lo` to spray from 2^64 addresses. Bucket IPv6 by `/64` so the
+    limit is meaningful; keep IPv4 at `/32`.
+    """
+    if not ip:
+        return ""
+    if ":" in ip:
+        # IPv6 — collapse to /64 (first 4 hextets). `::ffff:1.2.3.4` form
+        # (IPv4-mapped) will fall through and get bucketed as ipv4.
+        try:
+            import ipaddress as _ipa
+            addr = _ipa.ip_address(ip)
+            if isinstance(addr, _ipa.IPv6Address):
+                if addr.ipv4_mapped:
+                    return f"v4:{addr.ipv4_mapped}"
+                net = _ipa.ip_network(f"{ip}/64", strict=False)
+                return f"v6/64:{net.network_address}"
+        except ValueError:
+            pass
+    return f"v4:{ip}"
+
 
 def _note_auth_fail(ip: str) -> bool:
     """Record an auth failure for *ip*. Returns True if the caller is now
     over the limit (caller should return 429 / close with 4429)."""
-    if not ip:
+    key = _rate_limit_key(ip)
+    if not key:
         return False
     import time as _time
     now = _time.monotonic()
     cutoff = now - _AUTH_FAIL_WINDOW_SEC
     with _auth_fail_lock:
-        bucket = _auth_fail_log.setdefault(ip, [])
-        # Prune old entries and cap bucket size to prevent unbounded growth
-        # from a persistent attacker (keep only window-relevant timestamps).
-        bucket[:] = [t for t in bucket if t > cutoff]
+        bucket = _auth_fail_log.setdefault(key, [])
+        # Prune old entries, cap bucket depth so a trivial sustained spray
+        # can't grow one bucket to 60 000 timestamps under load (R9/#3).
+        bucket[:] = [t for t in bucket if t > cutoff][-_AUTH_FAIL_LIMIT:]
         bucket.append(now)
-        # Periodic GC of idle IPs so the dict doesn't grow forever.
-        if len(_auth_fail_log) > 1024:
+        # Periodic GC of idle buckets so the dict itself doesn't grow
+        # unbounded under an IPv6 /64 rotation attack (R9/#2).
+        if len(_auth_fail_log) > _AUTH_FAIL_GC_THRESHOLD:
             for k in [k for k, v in _auth_fail_log.items() if not v or v[-1] < cutoff]:
                 _auth_fail_log.pop(k, None)
         return len(bucket) >= _AUTH_FAIL_LIMIT
 
 
 def _client_ip(request_or_ws) -> str:
+    """Return the client IP for rate-limit keying.
+
+    R9/#2: when `CORTEX_TRUST_PROXY_HEADERS=1` is set the operator is
+    responsible for only placing a trusted proxy in front of uvicorn.
+    In that case honour the LEFTMOST non-internal X-Forwarded-For entry
+    so the rate-limit doesn't collapse every real user into the proxy
+    bucket. Otherwise stick with the TCP peer."""
     try:
+        if TRUST_PROXY_HEADERS and hasattr(request_or_ws, "headers"):
+            xff = request_or_ws.headers.get("x-forwarded-for", "")
+            if xff:
+                # Leftmost is the original client; trim whitespace.
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
         client = getattr(request_or_ws, "client", None)
         if client and client.host:
             return client.host
@@ -260,7 +303,7 @@ def _is_request_https(request) -> bool:
             return proto == "https"
     return request.url.scheme == "https"
 
-def _require_auth(authorization: str = None, x_token: str = None,
+def _require_auth(request=None, authorization: str = None, x_token: str = None,
                   query_token: str = None, cookie_token: str = None):
     """Authenticate using (in preference order): cookie session id,
     Authorization header, X-Token header, ?token= query.
@@ -268,7 +311,13 @@ def _require_auth(authorization: str = None, x_token: str = None,
     R8/T1: cookie path verifies against the server-side session table
     (`_check_session_cookie`), not the master `AUTH_TOKEN`. Only the
     header/query fallbacks use the master token (for CLI / curl / tests
-    — those clients do their own long-lived auth)."""
+    — those clients do their own long-lived auth).
+
+    R9/#1: rate-limit failures here, not only in `root()` / `ws_endpoint()`.
+    Every /api/* handler also consumes the master token, so without the
+    check here a weak `WEB_TOKEN` could be brute-forced through
+    `/api/sessions?token=...`.
+    """
     if cookie_token and _check_session_cookie(cookie_token):
         return
     token = ""
@@ -278,8 +327,13 @@ def _require_auth(authorization: str = None, x_token: str = None,
         token = x_token
     elif query_token:
         token = query_token
-    if not _check_auth(token):
-        raise HTTPException(status_code=401, detail="Invalid or missing token")
+    if _check_auth(token):
+        return
+    ip = _client_ip(request) if request is not None else ""
+    over = _note_auth_fail(ip)
+    if over:
+        raise HTTPException(status_code=429, detail="Too many auth failures")
+    raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 app = FastAPI(title="Cortex")
 
@@ -2005,11 +2059,12 @@ def _model_fits(param_size_str: str, ram_gb: float) -> str:
     return "no"
 
 @app.get("/api/models")
-async def list_models(authorization: str = Header(default=None),
+async def list_models(request: Request,
+                      authorization: str = Header(default=None),
                       x_token: str = Header(default=None),
                       cortex_session: str = Cookie(default="")):
     """List Ollama models with capabilities and compatibility info."""
-    _require_auth(authorization, x_token, cookie_token=cortex_session)
+    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     ram_gb = _get_ram_gb()
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
@@ -2037,12 +2092,12 @@ async def list_models(authorization: str = Header(default=None),
         return {"models": [], "current": OLLAMA_MODEL, "error": str(e)}
 
 @app.post("/api/model")
-async def switch_model(body: dict,
+async def switch_model(request: Request, body: dict,
                        authorization: str = Header(default=None),
                        x_token: str = Header(default=None),
                        cortex_session: str = Cookie(default="")):
     """Switch the active model. Validates against available Ollama models."""
-    _require_auth(authorization, x_token, cookie_token=cortex_session)
+    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     global OLLAMA_MODEL
     new_model = body.get("model", "")
     if not new_model or not isinstance(new_model, str):
@@ -2061,20 +2116,21 @@ async def switch_model(body: dict,
     return {"ok": True, "model": OLLAMA_MODEL}
 
 @app.get("/api/sessions")
-async def list_sessions(authorization: str = Header(default=None),
+async def list_sessions(request: Request,
+                        authorization: str = Header(default=None),
                         x_token: str = Header(default=None),
                         cortex_session: str = Cookie(default="")):
     """List saved sessions."""
-    _require_auth(authorization, x_token, cookie_token=cortex_session)
+    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     return {"sessions": _list_sessions_local()}
 
 @app.get("/api/session/{session_id}")
-async def get_session(session_id: str,
+async def get_session(session_id: str, request: Request,
                       authorization: str = Header(default=None),
                       x_token: str = Header(default=None),
                       cortex_session: str = Cookie(default="")):
     """Load a session."""
-    _require_auth(authorization, x_token, cookie_token=cortex_session)
+    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session id format")
     data = _load_session_local(session_id)
@@ -2083,12 +2139,12 @@ async def get_session(session_id: str,
     return data
 
 @app.delete("/api/session/{session_id}")
-async def delete_session(session_id: str,
+async def delete_session(session_id: str, request: Request,
                          authorization: str = Header(default=None),
                          x_token: str = Header(default=None),
                          cortex_session: str = Cookie(default="")):
     """Delete a session."""
-    _require_auth(authorization, x_token, cookie_token=cortex_session)
+    _require_auth(request, authorization, x_token, cookie_token=cortex_session)
     if not _valid_session_id(session_id):
         raise HTTPException(status_code=400, detail="invalid session id format")
     path = SESSIONS_DIR / f"{session_id}.json"

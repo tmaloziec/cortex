@@ -267,6 +267,17 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
             for tc in tc_list:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
+                # R9/N2: validate the tool name BEFORE policy check /
+                # DENY-ASK responses so the `name` field in those
+                # response dicts can't carry model-injected text.
+                if not _valid_tool_name(name):
+                    log.warning(f"invalid tool name rejected: {str(name)[:80]!r}")
+                    tool_results.append({
+                        "role": "tool",
+                        "content": "[BLOCKED] invalid tool name",
+                        "name": "invalid",
+                    })
+                    continue
                 raw_args = fn.get("arguments", {})
                 if isinstance(raw_args, dict):
                     args = raw_args
@@ -307,24 +318,14 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
                     if action == "retry":
                         result = execute_tool(name, args)
 
-                # R7/P1: worker is the autonomous path (no human in the
-                # loop), so an unwrapped tool output here is strictly
-                # worse than in the web path — a poisoned file / command
-                # output would reach the model with no <tool_output
-                # untrusted> fence and no rule #13 reminder. Validate
-                # name and wrap just like web.py does.
-                if not _valid_tool_name(name):
-                    tool_results.append({
-                        "role": "tool",
-                        "content": "[BLOCKED] invalid tool name",
-                        "name": "invalid",
-                    })
-                else:
-                    tool_results.append({
-                        "role": "tool",
-                        "content": wrap_tool_output(name, result),
-                        "name": name,
-                    })
+                # R7/P1: wrap_tool_output fences the autonomous path the
+                # same way web.py does for the interactive one. Name was
+                # already validated at the top of the loop (R9/N2).
+                tool_results.append({
+                    "role": "tool",
+                    "content": wrap_tool_output(name, result),
+                    "name": name,
+                })
 
             messages.extend(tool_results)
 

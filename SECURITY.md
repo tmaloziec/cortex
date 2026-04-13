@@ -591,6 +591,87 @@ Known limitations (v1.0.7.4):
   they load. Runtime-gating plugin-initiated subprocess calls is
   not planned for v1.x.
 
+### v1.0.7.5 additions (round-9: 3 audits converging)
+
+Round 9 combined three audits (Claude code review, red team round 3,
+Perplexity CVE/dep review) run against v1.0.7.3 + R8. The three
+converged on the same meta-finding: **fixes were scoped to specific
+call sites instead of invariants**. Rate limit lived in `root()` /
+`ws_endpoint()` but not `_require_auth`, so `/api/*` was unlimited;
+nonce-based wrap was applied to `<tool_output>` but not
+`<compacted_history>`. Both closed now.
+
+- **Rate limit bypass on /api/* (R1/#1, HIGH).** `_note_auth_fail`
+  ran only in the bootstrap and WS handlers. Every `/api/*` endpoint
+  also consumed the master token via `_require_auth` with no throttle,
+  so a weak `WEB_TOKEN` could be brute-forced through
+  `/api/sessions?token=<guess>` at wire speed. **Fixed:** rate-limit
+  moved into `_require_auth` itself. Every failed master-token
+  authentication (any endpoint, any header/query source) now goes
+  through the same sliding window. `root()` and `ws_endpoint()` keep
+  their own calls because they accept a pre-auth path.
+- **IPv6 /64 and proxy-collapse rate-limit keying (R2, MED).**
+  Pre-R9 the rate-limit key was the raw `request.client.host`. Two
+  problems: (a) behind a reverse proxy every real user shares the
+  proxy IP, so one attacker's 10 failures DoS'd everyone; (b) a real-
+  world IPv6 client can rotate from 2^64 distinct addresses in their
+  ISP-assigned `/64`, making `/128` keying useless. **Fixed:**
+  `_rate_limit_key` collapses IPv6 to `/64`, honours the leftmost
+  `X-Forwarded-For` entry when `CORTEX_TRUST_PROXY_HEADERS=1`
+  (opt-in), and otherwise falls through to the TCP peer.
+- **Rate-limit bucket depth cap (R3, LOW).** Pruned buckets still
+  grew with every sustained-attack timestamp. Capped to
+  `_AUTH_FAIL_LIMIT` most-recent entries after prune; the rate-limit
+  decision only needs the newest N timestamps.
+- **`<compacted_history>` nested-tag injection (R4/#2, HIGH).** Same
+  asymmetric close-only escape the R8/P1 fix addressed in
+  `wrap_tool_output`. Red team round 3 noticed it had been repeated
+  in `compactor.py`. **Fixed:** compacted-history container now uses
+  the same per-call nonce pattern — `<compacted_history_<nonce>
+  untrusted="true">…</compacted_history_<nonce>>`. Payload cannot
+  predict the nonce, cannot synthesise a matching opener.
+- **Plugin loader TOCTOU (R5, LOW).** `f.resolve().relative_to(…)`
+  validated the resolved path but `spec_from_file_location` was
+  called on the raw symlink `f`. An attacker who could swap the
+  symlink between check and use would execute a different file. Not
+  exploitable today (policy blocks writes into `plugins/`), but
+  hardened: resolved path is cached and used for both the
+  `relative_to` check and the `spec_from_file_location` call.
+- **Additional persistence patterns (R9/#5).** `_PERSISTENCE_DENY`
+  gained `plugins/*.{pth,so,pyc}` (all three are importlib entry
+  points — `.pth` executes at interpreter start via `site.py`, `.so`
+  ships compiled code, `.pyc` can pre-empt a source file with
+  matching mtime) and a generic `*.pth` pattern (site-packages
+  auto-loads any matching file).
+- **`PLUGIN_NAME` control-char sanitisation (R9/#6).** A plugin
+  could declare `PLUGIN_NAME = "evil\x1b[2Jlogspoof"` and have the
+  value flow into log lines / UI text, rewriting the terminal
+  banner or spoofing log prefixes. **Fixed:** declared name is
+  validated against `^[A-Za-z0-9_.-]{1,64}$`; rejected names fall
+  back to the filename stem with a warning.
+- **Worker DENY/ASK paths skipped `_valid_tool_name` (N2).** Moved
+  the name validation to the top of the tool-execution loop so the
+  model-emitted `name` can't ride in a DENY/ASK response dict.
+- **Compactor summarizer prompt hardening (N1).** Summarizer system
+  prompt now explicitly tells the model that the text below is data
+  to summarise, not instructions to follow — closes the indirect
+  path where assistant-turn quotes of attacker content could reach
+  the summarizer.
+
+Known limitations (v1.0.7.5):
+
+- **CSP `unsafe-inline` for scripts (R7).** Single-file UI with
+  inline `<script>`. Migrating to nonce-based CSP requires a small
+  templating refactor; tracked for v1.1 alongside the CS auth
+  service work. Every `innerHTML` sink in the UI goes through
+  `escHtml`; discipline-enforced, not CSP-enforced.
+- **Bootstrap URL replay (R8 T3).** Still an 8h-persistent URL that
+  lands in tmux/screen scrollback, session recordings, shell
+  history. One-shot rotation lands with `CORTEX_AUTH_MODE=cs` in v1.1.
+- **No success audit log (R8 R8).** `_note_auth_fail` logs only
+  failures. Success is silent. Acceptable for a single-user local
+  tool; tracked for later.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection

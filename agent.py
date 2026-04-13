@@ -203,7 +203,8 @@ def discover_plugins(plugin_dir: Path = None) -> dict:
         # Refuse plugins whose resolved path escapes plugin_dir (symlink
         # pointing outside). relative_to raises ValueError on escape.
         try:
-            f.resolve().relative_to(plugin_dir)
+            resolved_f = f.resolve()
+            resolved_f.relative_to(plugin_dir)
         except ValueError:
             log.warning("discover_plugins: skipping symlink escape: %s", f.name)
             continue
@@ -213,7 +214,13 @@ def discover_plugins(plugin_dir: Path = None) -> dict:
         # identity is still PLUGIN_NAME.
         mod_key = f"cortex_plugins.{f.stem}"
         try:
-            spec = importlib.util.spec_from_file_location(mod_key, f)
+            # R9/#R5: pass the already-resolved path to importlib so the
+            # check-then-use pair operates on the same inode. If an
+            # attacker could swap the symlink between `f.resolve()` above
+            # and `exec_module` below, they'd run a different file than
+            # the one we validated. Not exploitable today (writing into
+            # plugins/ is blocked by policy) but trivial to harden.
+            spec = importlib.util.spec_from_file_location(mod_key, resolved_f)
             mod = importlib.util.module_from_spec(spec)
             # Register BEFORE exec_module so relative imports inside the
             # plugin work. On failure we must roll back not just mod_key
@@ -229,7 +236,17 @@ def discover_plugins(plugin_dir: Path = None) -> dict:
                 for k in set(sys.modules) - snapshot:
                     sys.modules.pop(k, None)
                 raise
-            name = getattr(mod, "PLUGIN_NAME", f.stem)
+            raw_name = getattr(mod, "PLUGIN_NAME", f.stem)
+            # R9/#6: PLUGIN_NAME lands in log lines and UI text. A hostile
+            # (or sloppy) plugin could embed ANSI escapes / control chars
+            # to rewrite the terminal banner or spoof log prefixes. Keep
+            # to a conservative set; fall back to the filename stem if
+            # the declared name is malformed.
+            if not isinstance(raw_name, str) or not re.match(r"^[A-Za-z0-9_.-]{1,64}$", raw_name):
+                log.warning("discover_plugins: PLUGIN_NAME of %s rejected (bad chars), using stem",
+                            f.name)
+                raw_name = f.stem
+            name = raw_name
             plugins[name] = mod
             log.info(f"Plugin loaded: {name}")
         except Exception as e:
