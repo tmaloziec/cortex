@@ -29,6 +29,7 @@ Modules:
 import os
 import sys
 import json
+import html as _html
 import glob as glob_module
 import socket
 import subprocess
@@ -123,6 +124,14 @@ class C:
 # ─── PLUGIN SYSTEM ─────────────────────────────────────────────────────────────
 PLUGINS = {}  # name -> plugin module
 
+# Validate model-emitted tool names before we use them in policy checks,
+# subprocess argv, or XML attributes. Kept in agent.py so CLI and web
+# paths share one definition (web.py imports _valid_tool_name from here).
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+def _valid_tool_name(name) -> bool:
+    return isinstance(name, str) and bool(_TOOL_NAME_RE.match(name))
+
 def discover_plugins(plugin_dir: Path = None) -> dict:
     """
     Load plugins from plugins/ directory.
@@ -156,14 +165,18 @@ def discover_plugins(plugin_dir: Path = None) -> dict:
             spec = importlib.util.spec_from_file_location(mod_key, f)
             mod = importlib.util.module_from_spec(spec)
             # Register BEFORE exec_module so relative imports inside the
-            # plugin work; rollback on failure so a plugin that raises in
-            # its top-level doesn't leave a half-initialised module in
-            # sys.modules for the rest of the process lifetime (audit R4 H-03).
+            # plugin work. On failure we must roll back not just mod_key
+            # itself but every submodule the plugin managed to register
+            # before raising — otherwise a broken plugin that did
+            # `import cortex_plugins.helper` leaves that helper cached,
+            # shadowing future loads (R5 MED #4; extends R4 H-03).
+            snapshot = set(sys.modules)
             sys.modules[mod_key] = mod
             try:
                 spec.loader.exec_module(mod)
             except Exception:
-                sys.modules.pop(mod_key, None)
+                for k in set(sys.modules) - snapshot:
+                    sys.modules.pop(k, None)
                 raise
             name = getattr(mod, "PLUGIN_NAME", f.stem)
             plugins[name] = mod
@@ -453,14 +466,25 @@ def wrap_tool_output(name: str, result: str) -> str:
     to treat the payload as data, not as instructions. Paired with the
     system-prompt rule about `<tool_output untrusted="true">` (rule #13).
 
-    Any existing ``</tool_output>`` inside the result is escaped to stop the
-    model (or an attacker-authored file) from closing the container early
-    and injecting out-of-band instructions after it.
+    Two escaping concerns:
+
+    * *Attribute injection (R5 HIGH #1):* the model can emit anything into
+      ``function.name``. A crafted name like ``bash" injected="evil`` would
+      break out of the ``tool="..."`` attribute and let a later attribute
+      strip ``untrusted="true"``. ``html.escape(..., quote=True)`` replaces
+      ``"`` with ``&quot;``, plus ``<>&`` for safety, so the attribute stays
+      a single string regardless of model output. The CLI agent loop doesn't
+      call ``_valid_tool_name`` before us (web.py does), so this is the
+      last line of defence.
+    * *Container escape:* a file whose contents include ``</tool_output>``
+      would close our container early. Replace with a non-matching form so
+      the close tag we emit is the only one.
     """
     if not isinstance(result, str):
         result = str(result)
+    safe_name = _html.escape(str(name), quote=True)
     safe = result.replace("</tool_output>", "<_/tool_output>")
-    return f'<tool_output untrusted="true" tool="{name}">\n{safe}\n</tool_output>'
+    return f'<tool_output untrusted="true" tool="{safe_name}">\n{safe}\n</tool_output>'
 
 
 def execute_tool(name: str, args: dict) -> str:
@@ -862,6 +886,17 @@ def agent_loop(messages: list, session_id: str, policy: PolicyEngine,
         for tc in tc_list:
             fn   = tc.get("function", {})
             name = fn.get("name", "")
+            # Reject obviously-malformed tool names before policy check or
+            # XML interpolation — web.py does this too, but the CLI loop
+            # needs its own guard (R5 HIGH #1).
+            if not _valid_tool_name(name):
+                print(f"\n{C.RED}[INVALID TOOL NAME]{C.RESET} {str(name)[:80]!r}")
+                tool_results.append({
+                    "role": "tool",
+                    "content": "[BLOCKED] invalid tool name",
+                    "name": "invalid",
+                })
+                continue
             raw_args = fn.get("arguments", {})
             if isinstance(raw_args, dict):
                 args = raw_args

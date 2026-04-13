@@ -443,9 +443,21 @@ We do **not** defend against:
   cookie and redirected away, but treat the initial URL as sensitive
   and do not paste it into chat/issue trackers.
 - The WebSocket handshake falls back to `?token=` when no cookie is
-  attached (CLI clients, tests). A future release is expected to use
+  attached (CLI clients, tests, `ws_test.py`). For those callers the
+  token still appears in access logs and any Referer header they
+  generate — same leakage profile as the pre-v1.0.7 browser flow. The
+  browser flow no longer does this; the cookie exchange runs on first
+  `GET /`. A future release is expected to use
   `Sec-WebSocket-Protocol`-based auth so the token never appears in any
-  URL even for those clients.
+  URL even for CLI clients.
+- The session cookie's `Secure` flag defaults to "set only when uvicorn
+  itself sees `https://`". Behind a TLS-terminating reverse proxy
+  (nginx, caddy) uvicorn sees the plaintext LAN leg and would otherwise
+  mark the cookie insecure. Set `CORTEX_TRUST_PROXY_HEADERS=1` to
+  honour `X-Forwarded-Proto` from a trusted proxy. Do **not** set it
+  when uvicorn is reachable directly on the network — a LAN attacker
+  who can reach uvicorn would spoof the header and downgrade the
+  cookie's `Secure` flag.
 - `get_ram_gb()` reads `/proc/meminfo` and returns `0` on macOS/Windows,
   which makes the "fits-in-RAM" hint in the model picker unreliable off
   Linux. It does not affect security.

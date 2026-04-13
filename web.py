@@ -102,10 +102,8 @@ for _name in ("uvicorn.access", "uvicorn.error", "uvicorn"):
 # Tool names are model-produced; reject anything outside this shape before
 # logging, dispatching, or rendering in the UI. Prevents XSS via crafted
 # tool_calls[].function.name and keeps the WS protocol schema tight.
-_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
-
-def _valid_tool_name(name) -> bool:
-    return isinstance(name, str) and bool(_TOOL_NAME_RE.match(name))
+# _valid_tool_name lives in agent.py (single source of truth) — re-export
+# lazily below once the module is loaded.
 
 # How long to wait for a user ASK-approval over the WebSocket before timing
 # out and treating the call as denied. Configurable; keep short enough that
@@ -146,6 +144,22 @@ def _check_auth(token: str) -> bool:
 # with ?token=. Separate from AUTH_TOKEN so future refactors (JWT/CS-backed
 # cookies, rotation) can change one without touching the other.
 AUTH_COOKIE_NAME = "cortex_session"
+
+# Trust reverse-proxy X-Forwarded-Proto when deciding whether the client
+# connection was HTTPS. Opt-in: blindly trusting forwarded headers lets a
+# LAN attacker who can reach uvicorn directly spoof "https" and harvest
+# the Secure cookie anyway. Only enable if uvicorn binds to localhost
+# and a trusted nginx/caddy is in front. (R5 MED #3.)
+TRUST_PROXY_HEADERS = os.getenv("CORTEX_TRUST_PROXY_HEADERS") == "1"
+
+def _is_request_https(request) -> bool:
+    """Decide cookie Secure flag. Honours X-Forwarded-Proto only when the
+    operator has explicitly opted in via CORTEX_TRUST_PROXY_HEADERS=1."""
+    if TRUST_PROXY_HEADERS:
+        proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if proto in ("http", "https"):
+            return proto == "https"
+    return request.url.scheme == "https"
 
 def _require_auth(authorization: str = None, x_token: str = None,
                   query_token: str = None, cookie_token: str = None):
@@ -1448,6 +1462,7 @@ TOOLS          = _agent.TOOLS
 build_system_prompt = _agent.build_system_prompt
 get_briefing   = _agent.get_briefing
 save_session_to_cs  = _agent.save_session_to_cs
+_valid_tool_name = _agent._valid_tool_name
 
 # Policy & Recovery & Compactor
 from policy import PolicyEngine, PolicyDecision
@@ -1475,7 +1490,7 @@ async def root(request: Request,
     # in the address bar / browser history / Referer header no longer
     # carries the long-lived token (red team #6).
     if token and _check_auth(token):
-        is_https = request.url.scheme == "https"
+        is_https = _is_request_https(request)
         resp = RedirectResponse(url="/", status_code=303)
         resp.set_cookie(
             key=AUTH_COOKIE_NAME,

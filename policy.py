@@ -336,25 +336,35 @@ def _expand_shared_lists(policies: dict) -> dict:
     history     = policies.pop("_HISTORY_DENY", [])
     system_dirs = policies.pop("_SYSTEM_DIRS_DENY", [])
 
+    def _merge_unique(*lists):
+        """Order-preserving dedup. Re-running _expand_shared_lists() on an
+        already-expanded policy (hot-reload, _merge_policies re-expansion
+        from R5 HIGH #2) would otherwise double every deny each time."""
+        seen = {}
+        for lst in lists:
+            for item in lst:
+                if item not in seen:
+                    seen[item] = None
+        return list(seen.keys())
+
     # Write paths: persistence + credentials (poisoning) + system dirs.
     for tool in ("write_file", "edit_file"):
         rules = policies.setdefault(tool, {"deny": [], "allow": [r".*"]})
-        rules["deny"] = list(system_dirs) + list(persistence) + list(credential) + list(rules.get("deny", []))
+        rules["deny"] = _merge_unique(system_dirs, persistence, credential, rules.get("deny", []))
 
     # Read paths: credentials + history. Persistence files are technically
     # readable (they're config, not secrets) but some like crontab can
     # expose scheduled-job secrets — credential list already covers the
     # worst of it.
-    policies.setdefault("read_file", {"deny": [], "allow": [r".*"]})["deny"] = (
-        list(credential) + list(history) + list(policies["read_file"].get("deny", []))
-    )
+    rf = policies.setdefault("read_file", {"deny": [], "allow": [r".*"]})
+    rf["deny"] = _merge_unique(credential, history, rf.get("deny", []))
 
     # grep_search, list_dir and glob_find must not become a read_file bypass:
     # if read_file denies a credential, an unrestricted search/enumeration
     # across the same path would still let the model discover or read it.
     for tool in ("grep_search", "list_dir", "glob_find"):
         rules = policies.setdefault(tool, {"deny": [], "allow": [r".*"]})
-        rules["deny"] = list(credential) + list(history) + list(rules.get("deny", []))
+        rules["deny"] = _merge_unique(credential, history, rules.get("deny", []))
 
     return policies
 
@@ -466,13 +476,30 @@ class PolicyEngine:
         for tool, rules in custom.items():
             if tool in shared_keys:
                 continue  # handled by re-expansion below
+            # R5 LOW #6: reject malformed tool entries per-tool with a
+            # visible warning instead of bubbling a TypeError to __init__
+            # and silently discarding the *entire* custom policy. Scalar
+            # "deny": "..." (instead of a list) was the original trigger.
+            if not isinstance(rules, dict):
+                log.warning("custom policy: tool %r must map to an object, got %s — skipping",
+                            tool, type(rules).__name__)
+                continue
+            bad = False
+            for key in ("deny", "ask", "allow"):
+                if key in rules and not isinstance(rules[key], list):
+                    log.warning("custom policy: %s.%s must be a list, got %s — skipping tool",
+                                tool, key, type(rules[key]).__name__)
+                    bad = True
+                    break
+            if bad:
+                continue
             if tool not in self.policies:
                 self.policies[tool] = rules
             else:
                 for key in ("deny", "ask", "allow"):
                     if key in rules:
                         existing = self.policies[tool].get(key, [])
-                        self.policies[tool][key] = rules[key] + existing
+                        self.policies[tool][key] = list(rules[key]) + list(existing)
 
         if has_shared:
             # Re-run the shared-list expansion with the user's additions
