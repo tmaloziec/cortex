@@ -377,42 +377,13 @@ def _is_request_https(request) -> bool:
             return proto == "https"
     return request.url.scheme == "https"
 
-def _require_auth(request=None, authorization: str = None, x_token: str = None,
-                  query_token: str = None, cookie_token: str = None):
-    """Authenticate using (in preference order): cookie session id,
-    Authorization header, X-Token header, ?token= query.
-
-    R8/T1: cookie path verifies against the server-side session table
-    (`_check_session_cookie`), not the master `AUTH_TOKEN`. Only the
-    header/query fallbacks use the master token (for CLI / curl / tests
-    — those clients do their own long-lived auth).
-
-    R9/#1: rate-limit failures here, not only in `root()` / `ws_endpoint()`.
-    Every /api/* handler also consumes the master token, so without the
-    check here a weak `WEB_TOKEN` could be brute-forced through
-    `/api/sessions?token=...`.
-    """
-    if cookie_token and _check_session_cookie(cookie_token):
-        # R10/#2: authenticated per-session throttle. A stolen cookie
-        # used to mean unlimited API; now 600 req/min/session caps the
-        # scripted exfil case without impacting realistic human traffic.
-        if _note_session_hit(cookie_token):
-            raise HTTPException(status_code=429, detail="Session rate limit exceeded")
-        return
-    token = ""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:]
-    elif x_token:
-        token = x_token
-    elif query_token:
-        token = query_token
-    if _check_auth(token):
-        return
-    ip = _client_ip(request) if request is not None else ""
-    over = _note_auth_fail(ip)
-    if over:
-        raise HTTPException(status_code=429, detail="Too many auth failures")
-    raise HTTPException(status_code=401, detail="Invalid or missing token")
+# R14/M4: the old inline `_require_auth` was replaced by
+# `_require_auth_dep` (FastAPI Depends wired to security.auth) in R13.
+# The old function lingered unused next to the new one — drift risk
+# (invariant #2 accepted both names as the dependency token, so a
+# future endpoint could have Depends(_require_auth) and bypass the
+# master-token throttle). Removed entirely. Every route now uses the
+# security-package-backed _require_auth_dep.
 
 app = FastAPI(title="Cortex")
 
@@ -1722,9 +1693,20 @@ from policy import PolicyEngine, PolicyDecision
 from compactor import compact_messages, should_compact, estimate_tokens
 from recovery import RecoveryEngine
 
+# R14/H1: regression of R13/C2 — this line used to be
+#   fallback_fn=_agent.call_anthropic if _agent.ANTHROPIC_KEY else None
+# which (a) mere-key-presence enabled silent Anthropic upload on any
+# transient Ollama blip, and (b) slipped past invariant #4's regex
+# because of the `_agent.` attribute prefix. Both fixed: go through
+# security.FallbackPolicy.from_env so the opt-in flag + WARN log are
+# enforced, and the invariant test (now AST-based) can't miss it.
+from security import FallbackPolicy as _FallbackPolicy
 _policy = PolicyEngine()
 _recovery = RecoveryEngine(
-    fallback_fn=_agent.call_anthropic if _agent.ANTHROPIC_KEY else None,
+    fallback_fn=_FallbackPolicy.from_env(
+        anthropic_key=_agent.ANTHROPIC_KEY,
+        call_fn=_agent.call_anthropic,
+    ).as_recovery_callable(),
     compact_fn=lambda msgs: compact_messages(msgs, OLLAMA_URL, OLLAMA_MODEL, keep_last=6),
 )
 

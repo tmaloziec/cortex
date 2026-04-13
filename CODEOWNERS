@@ -18,7 +18,17 @@
 # the invariant exists.
 /security/                  @tmaloziec
 /tests/test_invariants.py   @tmaloziec
+/tests/test_policy.py       @tmaloziec
+/policy.py                  @tmaloziec
 /SECURITY.md                @tmaloziec
+
+# R14/#5: protect CI configuration + the CODEOWNERS file itself.
+# Otherwise a PR could disable the guards or drop the ownership rule
+# in the same diff.
+/.github/                   @tmaloziec
+/CODEOWNERS                 @tmaloziec
+/conftest.py                @tmaloziec
+/run.sh                     @tmaloziec
 
 # Dependency pins (CVE-relevant).
 /requirements.txt           @tmaloziec

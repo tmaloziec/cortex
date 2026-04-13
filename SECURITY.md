@@ -950,6 +950,78 @@ so they landed alongside but separate from the structural refactor:
   from another device, or `WEB_TOKEN` is rotated) now stops the
   agent loop within one tool call rather than at end-of-turn.
 
+### v1.0.8-rc2 — R14: enforcer hardening + regression fix
+
+R14 audits (Claude code-review, Claude red team, Perplexity CVE scan,
+GPT architectural review) found that the R13 invariant refactor was
+structurally sound, but the *enforcer* itself had two shortcuts that
+let the "scoped-fix-not-invariant" pattern sneak through:
+
+- **C1 [CRITICAL] fastapi / starlette pins unresolvable.**
+  `fastapi>=0.116.0,<0.120.0` + `starlette==0.49.1` could not be
+  installed — fastapi 0.116-0.119 all require `starlette<0.49.0`,
+  so pip refused the combination entirely. The R13 comment claimed
+  both CVEs closed but the pin widening was wrong. Perplexity
+  caught it. Fixed: `fastapi>=0.120.4,<0.136.0` — 0.120.4 widened
+  starlette to `<0.50.0` so 0.49.1 (with the CVE fixes) is now
+  installable. Comment rewritten to direct future bumps through
+  `pip-audit -r requirements.txt` instead of trusting chains.
+
+- **H1 [HIGH] web.py regressed R13/C2 under a different call shape.**
+  `fallback_fn=_agent.call_anthropic if _agent.ANTHROPIC_KEY else None`
+  at web.py:1727 — same "bare fallback" pattern that R13/C2 closed
+  in the interactive agent, now with the `_agent.` attribute prefix.
+  The original invariant #4 test was regex-based and literally
+  matched `fallback_fn\s*=\s*call_anthropic`; the attribute prefix
+  defeated it. The audit that was meant to prevent this regression
+  let it through. Fixed on two levels: (a) `_recovery` now wires
+  through `FallbackPolicy.from_env(...).as_recovery_callable()` like
+  every other site, (b) invariant #4 rewritten as an AST walker that
+  matches `fallback_fn=X if Y else None` where X references
+  `call_anthropic` (as Name or attribute, any depth) and Y
+  references `ANTHROPIC_KEY`. No regex in the invariant any more.
+
+Hardening around the invariants themselves:
+
+- **Allow-comment tokenisation.** The escape-hatch comment
+  `# invariant: allow-<id> because <reason>` was previously matched
+  via `re.search` on the raw source line. A string literal on the
+  same line that contained the magic substring would satisfy the
+  regex. Now `tokenize.generate_tokens` identifies the comment span
+  explicitly; string literals cannot trigger the exemption.
+- **Dynamic target discovery.** Invariant tests used to read a
+  hardcoded `_TARGET_FILES` tuple of six filenames. A new top-level
+  module (say, a future SSE endpoint or MCP bridge) would ship
+  completely invisible to the AST checks. Replaced with
+  `_REPO.glob("*.py")` minus an explicit exclusion set
+  (`security/`, `tests/`, `plugins/`, venv/build dirs).
+- **Subscript assignments walked.** `d["role"] = "tool"` plus a
+  later `messages.append(d)` used to build a role=tool message
+  without ever tripping the Dict-literal detector. The walker now
+  catches subscript assignment to the string key `"role"` with a
+  string literal value, alongside Dict and `dict(...)` call forms.
+- **Dead `_require_auth` removed.** Structure-level R13 introduced
+  `_require_auth_dep` (the Depends wiring) but left the old inline
+  `_require_auth` next to it. Invariant #2's suffix-match happened
+  to accept both names — a new endpoint binding to the dead
+  function would bypass the master-token throttle. Removed the
+  dead function; narrowed the allow-list to
+  `_require_auth_dep` / `public_endpoint`.
+- **CODEOWNERS widened.** Added `policy.py`, `tests/test_policy.py`,
+  `.github/`, `/CODEOWNERS` (self-protection), `conftest.py`,
+  `run.sh`. A PR that tried to drop the ownership rule as part of
+  relaxing a test would now need sign-off on the CODEOWNERS change
+  itself.
+
+Meta-diagnosis (GPT architectural review): the R13 design was
+correct, the implementation took regex-based shortcuts in the
+test layer that the red team had explicitly warned about in the
+pre-refactor review. Enforcer is only as strong as the weakest
+rule in it. R14 removes the two shortcuts; future rounds can
+attack the invariants again (the test file IS code and can have
+bugs too), but the class of "write the obvious pattern with a
+trivial prefix" is closed.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection

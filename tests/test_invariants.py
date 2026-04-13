@@ -26,23 +26,33 @@ Phase policy:
 from __future__ import annotations
 
 import ast
+import io
 import pathlib
 import re
 import sys
+import tokenize
 
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 
-# Files the invariants apply to. security/ is excluded — it IS the
-# invariant definition. tests/ is excluded — test fixtures frequently
-# construct bare dicts for setup.
-_TARGET_FILES = (
-    "agent.py",
-    "web.py",
-    "worker.py",
-    "compactor.py",
-    "recovery.py",
-    "policy.py",
-)
+# R14/#3: discover every top-level .py file automatically instead of a
+# static allow-list. A new module at the repo root (next ingress type,
+# new subcommand, future API) inherits the invariants without a test
+# edit. Keep the exclusion set explicit — security/ IS the invariant
+# definition; tests/ intentionally constructs bare dicts for fixtures.
+_EXCLUDE_DIRS = {"security", "tests", "plugins", "venv", ".venv",
+                 "__pycache__", ".git", "build", "dist"}
+_EXCLUDE_FILES = {"ws_test.py"}  # CLI smoke-test, not agent code
+
+
+def _discover_targets():
+    """Yield (name, text) for every source file the invariants apply to."""
+    for path in sorted(_REPO.glob("*.py")):
+        if path.name in _EXCLUDE_FILES:
+            continue
+        yield path.name, path.read_text()
+    # Also cover the immediate top-level helper modules if they sit in
+    # a single subdir that isn't explicitly excluded. Keep this narrow
+    # for now — widen only when a new integration lands.
 
 # Phase flag. Flipped to True after R13 phase-1 migration completed —
 # all source files now route through security/* and any regression
@@ -52,14 +62,47 @@ STRICT = True
 
 
 def _targets():
-    for name in _TARGET_FILES:
-        path = _REPO / name
-        if path.exists():
-            yield name, path.read_text()
+    return _discover_targets()
 
 
-def _allow_comment(line: str, rule_id: str) -> bool:
-    return bool(re.search(rf"# invariant: allow-{rule_id} because .+", line))
+def _comment_strings_on_line(src: str, lineno: int) -> list[str]:
+    """Return just the comment tokens on *lineno* (1-indexed).
+
+    R14/#2 hardening: previously we ran the allow-regex on the raw
+    source line, which matched if the string literal on that line
+    happened to contain "# invariant: allow-X because Y". An attacker
+    (or a careless refactor) could bypass an invariant by sneaking the
+    magic text into a docstring or string constant. tokenize.generate_
+    tokens distinguishes COMMENT tokens from STRING tokens — we only
+    accept the former.
+    """
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except tokenize.TokenizeError:
+        return []
+    return [t.string for t in toks
+            if t.type == tokenize.COMMENT and t.start[0] == lineno]
+
+
+def _allow_comment(line_or_source: str, rule_id: str, lineno: int | None = None,
+                   src: str | None = None) -> bool:
+    """Return True iff there is a genuine comment-token on the given line
+    matching ``# invariant: allow-<rule_id> because <reason>``.
+
+    Two call shapes for back-compat with existing callers:
+      * ``_allow_comment(line, rule_id)`` — legacy string form, kept so
+        tests that passed a single raw line still work, but falls back
+        to substring match and is therefore weaker.
+      * ``_allow_comment(line, rule_id, lineno=N, src=FULL)`` — strict
+        tokenised form. Prefer this everywhere.
+    """
+    pattern = rf"# invariant: allow-{rule_id} because .+"
+    if src is not None and lineno is not None:
+        for comment in _comment_strings_on_line(src, lineno):
+            if re.search(pattern, comment):
+                return True
+        return False
+    return bool(re.search(pattern, line_or_source))
 
 
 def _line_of(src: str, node: ast.AST) -> str:
@@ -68,14 +111,18 @@ def _line_of(src: str, node: ast.AST) -> str:
 
 def _any_line_of_node_has_allow(src: str, node: ast.AST, rule_id: str) -> bool:
     """Allow-comment may live on any line spanned by the offending
-    node (dict literals can straddle several lines)."""
+    node (dict literals can straddle several lines).
+
+    R14/#2: tokenised check — the allow marker must live in a real
+    comment token, not in a string literal that happens to contain
+    the magic substring.
+    """
     start = getattr(node, "lineno", 0) or 0
     end = getattr(node, "end_lineno", start) or start
     if not start:
         return False
-    lines = src.splitlines()
-    for i in range(start - 1, min(end, len(lines))):
-        if _allow_comment(lines[i], rule_id):
+    for lineno in range(start, end + 1):
+        if _allow_comment(None, rule_id, lineno=lineno, src=src):
             return True
     return False
 
@@ -98,7 +145,12 @@ def _has_role_key(node: ast.Dict) -> str | None:
 
 def test_no_bare_role_dict_literals():
     """Invariant #1: conversation-message dicts go through
-    security.messages.make_message / make_tool_result / etc."""
+    security.messages.make_message / make_tool_result / etc.
+
+    R14/#6 adds subscript assignment to the detected patterns:
+    ``d["role"] = "tool"`` was a straight bypass of the original
+    walker. Any place that writes a literal role-name into a
+    subscript assignment is flagged too."""
     offenders: list[str] = []
     for fname, src in _targets():
         try:
@@ -108,12 +160,24 @@ def test_no_bare_role_dict_literals():
             continue
         for node in ast.walk(tree):
             role_val = None
+            # {"role": "<role>", ...}
             if isinstance(node, ast.Dict):
                 role_val = _has_role_key(node)
+            # dict(role="<role>", ...)
             elif isinstance(node, ast.Call) and _call_name(node) == "dict":
                 for kw in node.keywords:
                     if kw.arg == "role" and isinstance(kw.value, ast.Constant):
                         role_val = kw.value.value
+                        break
+            # d["role"] = "<role>"   (R14/#6)
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if (isinstance(tgt, ast.Subscript)
+                            and isinstance(tgt.slice, ast.Constant)
+                            and tgt.slice.value == "role"
+                            and isinstance(node.value, ast.Constant)
+                            and isinstance(node.value.value, str)):
+                        role_val = node.value.value
                         break
             if role_val is None:
                 continue
@@ -183,7 +247,13 @@ def test_every_route_has_auth_dependency():
     the configured instance of ``security.auth.require_auth``).
     """
     offenders: list[str] = []
-    allowed_suffixes = ("require_auth", "require_auth_dep", "public_endpoint")
+    # R14/M4: drop bare "require_auth" from the suffix allow-list. The
+    # old inline web.py._require_auth function was the drift vector —
+    # allowing both names let a future endpoint bind to the dead
+    # function and skip the master-token throttle. Only the Depends-
+    # wired variants (`_require_auth_dep` from build_require_auth, or
+    # anything whose name ends exactly in "public_endpoint") pass.
+    allowed_suffixes = ("require_auth_dep", "public_endpoint")
     for fname, src in _targets():
         try:
             tree = ast.parse(src)
@@ -235,17 +305,58 @@ def test_no_direct_client_host_access():
 
 def test_fallback_goes_through_policy():
     """Invariant #4: no ``fallback_fn = call_anthropic if ANTHROPIC_KEY``
-    style wiring. R13/C2 was exactly that pattern — mere key presence
-    silently enabled upload-on-connection-error. FallbackPolicy.from_env
-    keeps the gate in one place with a WARN log + opt-in flag."""
-    pattern = re.compile(r"fallback_fn\s*=\s*call_anthropic\s+if\s+ANTHROPIC_KEY")
+    style wiring. R13/C2 was exactly that pattern; R14/H1 found that
+    the original regex test missed ``_agent.call_anthropic`` because of
+    the attribute prefix. Switched to AST: any assignment / kwarg whose
+    value or RHS references ``call_anthropic`` (qualified or not) AND
+    gates on ``ANTHROPIC_KEY`` in the conditional expression fails the
+    test. Only going through ``FallbackPolicy.from_env(...).
+    as_recovery_callable()`` satisfies the invariant."""
     offenders: list[str] = []
+
+    def _references(node, target_name):
+        """True if *node* textually mentions *target_name* as a Name or
+        as the attribute of an Attribute (any depth)."""
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id == target_name:
+                return True
+            if isinstance(sub, ast.Attribute) and sub.attr == target_name:
+                return True
+        return False
+
+    def _fallback_suspects_from_ifexp(ifexp: ast.IfExp, fname, lineno, src):
+        """Given `X if ANTHROPIC_KEY else None`-shaped expression,
+        decide if it's the bare pattern and append to offenders.
+
+        Bare pattern: body references `call_anthropic`, test references
+        `ANTHROPIC_KEY`, orelse is None / false-ish."""
+        body_has_anthropic = _references(ifexp.body, "call_anthropic")
+        test_has_key = _references(ifexp.test, "ANTHROPIC_KEY")
+        if body_has_anthropic and test_has_key:
+            if _allow_comment(None, "bare-fallback", lineno=lineno, src=src):
+                return
+            offenders.append(
+                f"{fname}:{lineno} bare fallback IfExp — use FallbackPolicy.from_env"
+            )
+
     for fname, src in _targets():
-        for i, line in enumerate(src.splitlines(), 1):
-            if pattern.search(line):
-                if _allow_comment(line, "bare-fallback"):
-                    continue
-                offenders.append(f"{fname}:{i} {line.strip()[:120]}")
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            # Match any place the "X if ANTHROPIC_KEY else None" expression
+            # flows into something named fallback_fn — assignment target
+            # or keyword argument.
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if _attr_chain(target) and _attr_chain(target).endswith("fallback_fn"):
+                        if isinstance(node.value, ast.IfExp):
+                            _fallback_suspects_from_ifexp(node.value, fname, node.lineno, src)
+            if isinstance(node, ast.keyword) and node.arg == "fallback_fn":
+                if isinstance(node.value, ast.IfExp):
+                    _fallback_suspects_from_ifexp(node.value, fname, getattr(node, "lineno", 0), src)
+
     _assert(offenders, "Bare fallback_fn wiring — use FallbackPolicy.from_env")
 
 

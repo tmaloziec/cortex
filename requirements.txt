@@ -21,7 +21,15 @@
 #
 # Verify after any bump:  pip-audit -r requirements.txt
 requests==2.33.1
-fastapi>=0.116.0,<0.120.0
+# R14 correction: R13 pinned fastapi>=0.116.0,<0.120.0 assuming fastapi
+# would accept starlette 0.49.1 — it does not (fastapi 0.116-0.119 all
+# require starlette<0.49.0). Perplexity pip-audit caught: the combo was
+# unresolvable, pip refused to install the pinned set at all.
+#
+# fastapi 0.120.4 widens its starlette range to <0.50.0, so starlette
+# 0.49.1 (with the CVE fixes) is now installable. Verify after any bump:
+#   pip-audit -r requirements.txt
+fastapi>=0.120.4,<0.136.0
 starlette==0.49.1
 uvicorn==0.34.2
 websockets==15.0.1
