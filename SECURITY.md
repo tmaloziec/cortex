@@ -471,6 +471,45 @@ looked inside one file at a time. All five fundamentals closed.
   unobfuscated writes to known-dangerous paths now get a consistent
   denial regardless of which tool the model reaches for.
 
+### v1.0.7.3 additions (round-7 dep/CVE + code-review audit)
+
+Round-7 was a CVE-pattern + dep audit (fastapi 0.115.6 and its transitive
+deps all clean; no unsafe `eval`/`pickle`/`yaml.load`). Nine findings
+against Cortex code itself; P1/P2/P3/P4 fixed in-tree, the remainder
+documented under Known limitations.
+
+- **Worker autonomy vs `wrap_tool_output` (P1, HIGH).** `worker.py`
+  appended raw tool results to the message list — no `<tool_output
+  untrusted="true">` fence. The worker is the autonomous path (CS
+  polling, no human in the loop), so missing the wrap was strictly
+  worse than in web.py. Fixed: worker imports and uses both
+  `wrap_tool_output` and `_valid_tool_name`, matching the web path.
+- **Plugin directory confinement (P2, HIGH).** `discover_plugins`
+  accepted arbitrary `plugin_dir` paths and used `f.stem` straight as
+  the module-name suffix. A caller passing a directory outside the
+  project (or a symlink escaping one) could execute any `.py` under
+  the `cortex_plugins.*` namespace. Fixed: `plugin_dir.resolve()` must
+  live under the project root, plugin filenames must match
+  `^[A-Za-z][A-Za-z0-9_]*\.py$`, and each resolved plugin file must
+  also stay within plugin_dir (rejects symlink escapes).
+- **`WEB_TOKEN=""` opt-in (P3, MED).** Empty `WEB_TOKEN` previously
+  disabled auth silently on any host. Now it only takes effect when
+  `WEB_INSECURE=1` is also set; otherwise Cortex generates a random
+  token and logs a warning. Protects against typo'd env ("empty means
+  default" mental model) and against local processes that happened to
+  reach a no-auth Cortex on localhost (malware, compromised browser
+  extensions, SSRF from another local service).
+- **Auth brute-force rate limit (P4, MED).** `/?token=<guess>` and
+  `GET /ws?token=<guess>` had no throttle. Auto-generated 32-byte
+  tokens are immune to brute force (256 bits), but operators who
+  override with a weak `WEB_TOKEN` weren't. Added a lightweight
+  per-IP sliding-window counter (10 failures / 60s). HTTP returns 429;
+  WS closes with 4429. Bucket GCs idle IPs to cap memory.
+- **ws_test.py auth (P7, LOW).** Test client now reads `WEB_TOKEN`
+  from env and appends `?token=` to the WS URL, so the test script
+  works against an auth-on server without the operator having to set
+  `WEB_TOKEN=""` and `WEB_INSECURE=1`.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection

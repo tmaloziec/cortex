@@ -402,6 +402,47 @@ def test_compactor_summary_role_and_wrapper():
     assert "pretend user confirmed" not in turn["content"]
 
 
+# ─── P1 worker uses wrap_tool_output (R7) ────────────────────────────────
+def test_worker_imports_wrap_tool_output():
+    """Static check: worker.py must import wrap_tool_output and use it on
+    every tool_result it appends. The autonomous path has no human in the
+    loop; an unwrapped payload here is strictly worse than in web.py."""
+    src = (Path(__file__).resolve().parent.parent / "worker.py").read_text()
+    assert "wrap_tool_output" in src, "worker.py must import wrap_tool_output"
+    # the raw-content variant must NOT exist anymore
+    assert 'content": result,' not in src, \
+        "worker.py still appends raw result — prompt injection regression"
+
+
+# ─── P4 rate limit bucket behaviour (R7) ─────────────────────────────────
+def test_auth_fail_rate_limit():
+    import sys as _sys, importlib
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        # Systems without fastapi (bare-python CI) skip this test — the
+        # rate limiter is exercised indirectly by the test suite that
+        # does have the venv up (./run.sh first creates it).
+        print("  SKIP (fastapi not installed)")
+        return
+    # Force-import web module in a way that doesn't start uvicorn.
+    # web.py reads env at import; set a dummy token so auth is on.
+    os.environ["WEB_TOKEN"] = "test-for-rate-limit"
+    web = importlib.import_module("web")
+    # Clear any prior state.
+    with web._auth_fail_lock:
+        web._auth_fail_log.clear()
+    # First N-1 failures should stay under; the Nth trips the limit.
+    ip = "198.51.100.7"  # TEST-NET-2
+    over = False
+    for _ in range(web._AUTH_FAIL_LIMIT - 1):
+        over = web._note_auth_fail(ip) or over
+    assert not over, "rate limit tripped too early"
+    final = web._note_auth_fail(ip)
+    assert final, "rate limit did not trip at the boundary"
+
+
 # ─── Positive cases (regression: we didn't over-block) ───────────────────
 def test_legitimate_paths_still_allowed():
     p = PolicyEngine()

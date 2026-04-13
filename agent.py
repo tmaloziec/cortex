@@ -169,15 +169,42 @@ def discover_plugins(plugin_dir: Path = None) -> dict:
 
     Returns dict of {name: module}.
     """
+    # R7/P2: pin plugin_dir to a resolved path under PROJECT_ROOT. Previously
+    # a caller could pass an arbitrary directory; combined with any future
+    # path-controlled loader call this would let an attacker execute any
+    # `.py` on disk. The check also refuses symlinks whose target escapes
+    # the project (Path.resolve() dereferences symlinks before comparison).
+    project_root = Path(__file__).parent.resolve()
     if plugin_dir is None:
-        plugin_dir = Path(__file__).parent / "plugins"
+        plugin_dir = project_root / "plugins"
+    plugin_dir = Path(plugin_dir).resolve()
+    try:
+        plugin_dir.relative_to(project_root)
+    except ValueError:
+        log.warning("discover_plugins: refusing plugin_dir outside project: %s", plugin_dir)
+        return {}
 
     plugins = {}
     if not plugin_dir.is_dir():
         return plugins
 
+    # R7/P2: only accept well-formed plugin filenames. f.stem lands in the
+    # module-name slot (`cortex_plugins.<stem>`); anything past
+    # `[A-Za-z][A-Za-z0-9_]*` would either break the namespace or let a
+    # plugin file with a weird name inject dotted-path segments.
+    _plugin_name_re = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\.py$")
     for f in sorted(plugin_dir.glob("*.py")):
         if f.name.startswith("_"):
+            continue
+        if not _plugin_name_re.match(f.name):
+            log.warning("discover_plugins: skipping plugin with non-conforming name: %s", f.name)
+            continue
+        # Refuse plugins whose resolved path escapes plugin_dir (symlink
+        # pointing outside). relative_to raises ValueError on escape.
+        try:
+            f.resolve().relative_to(plugin_dir)
+        except ValueError:
+            log.warning("discover_plugins: skipping symlink escape: %s", f.name)
             continue
         # Name the module under a `cortex_plugins.` prefix so a broken plugin
         # can't shadow a real top-level module (e.g., a plugin named `os.py`

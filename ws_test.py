@@ -1,8 +1,15 @@
 import asyncio
 import json
+import os
 import websockets
 
-WS_URL = "ws://localhost:8080/ws"
+# R7/P7: pull WEB_TOKEN from env so ws_test works against an auth-on
+# server. The prior hardcoded URL silently failed (handshake closed with
+# 4401) unless the user also ran the server with WEB_TOKEN="". Appending
+# ?token= keeps this path working; the browser flow uses the cookie.
+_TOKEN = os.getenv("WEB_TOKEN", "")
+_BASE_WS = os.getenv("CORTEX_WS_URL", "ws://localhost:8080/ws")
+WS_URL = f"{_BASE_WS}?token={_TOKEN}" if _TOKEN else _BASE_WS
 TIMEOUT = 300  # seconds per test
 
 async def collect_until_done(ws, test_name, timeout=TIMEOUT):

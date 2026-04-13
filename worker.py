@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent))
 from agent import (
     execute_tool, call_model, call_anthropic, build_system_prompt,
+    wrap_tool_output, _valid_tool_name,
     TOOLS, OLLAMA_URL, OLLAMA_MODEL, CS_URL, ANTHROPIC_KEY,
     MAX_TOOL_LOOPS, CONTEXT_MAX_TOKENS, C
 )
@@ -306,11 +307,24 @@ def execute_task(task: dict, policy: PolicyEngine, recovery: RecoveryEngine) -> 
                     if action == "retry":
                         result = execute_tool(name, args)
 
-                tool_results.append({
-                    "role": "tool",
-                    "content": result,
-                    "name": name
-                })
+                # R7/P1: worker is the autonomous path (no human in the
+                # loop), so an unwrapped tool output here is strictly
+                # worse than in the web path — a poisoned file / command
+                # output would reach the model with no <tool_output
+                # untrusted> fence and no rule #13 reminder. Validate
+                # name and wrap just like web.py does.
+                if not _valid_tool_name(name):
+                    tool_results.append({
+                        "role": "tool",
+                        "content": "[BLOCKED] invalid tool name",
+                        "name": "invalid",
+                    })
+                else:
+                    tool_results.append({
+                        "role": "tool",
+                        "content": wrap_tool_output(name, result),
+                        "name": name,
+                    })
 
             messages.extend(tool_results)
 
