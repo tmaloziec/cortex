@@ -246,6 +246,16 @@ DEFAULT_POLICIES = {
         # prior tool_output (file contents, bash output) — reading it
         # defeats read_file denies through the back door.
         r"(^|/)\.cortex/sessions(/|$)",
+        # F3 (R6): filename-level patterns so glob_find can't locate
+        # credential files under a benign-looking parent. Directory-only
+        # patterns above miss glob_find(pattern="**/id_rsa", path="/home")
+        # because neither the pattern nor the path contain ".ssh/".
+        r"(^|/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$",
+        r"(^|/)authorized_keys$",
+        r"(^|/)known_hosts$",
+        r"(^|/)credentials$",
+        r"(^|/)\.env(\..+)?$",
+        r"(^|/)shadow$",
     ],
 
     # Historical files often contain typed passwords, tokens, or sensitive
@@ -365,6 +375,25 @@ def _expand_shared_lists(policies: dict) -> dict:
     for tool in ("grep_search", "list_dir", "glob_find"):
         rules = policies.setdefault(tool, {"deny": [], "allow": [r".*"]})
         rules["deny"] = _merge_unique(credential, history, rules.get("deny", []))
+
+    # F5 (R6): inherit _PERSISTENCE_DENY into bash.deny so the obvious,
+    # unobfuscated writes to known persistence paths (`echo X >>
+    # ~/.ssh/authorized_keys`, `crontab -`, `cp ... .git/hooks/post-commit`)
+    # share the same gate write_file/edit_file use. The bash filter remains
+    # a heuristic for obfuscated forms, but exact-path appends had no
+    # defence at all prior to this.
+    bash_rules = policies.setdefault("bash", {"deny": [], "allow": [r".*"]})
+    bash_rules["deny"] = _merge_unique(
+        bash_rules.get("deny", []),
+        # Persistence paths appear verbatim in the command line, so the
+        # read/write regex patterns work equally well against the bash
+        # command string (re.search across the whole line).
+        persistence,
+        # Credentials exfil via bash: `cat ~/.ssh/id_rsa`, `grep -r aws_
+        # ~/.aws`, `curl --upload-file ~/.env`, etc. — same argument as
+        # for grep_search / read_file: bash should not be the back door.
+        credential,
+    )
 
     return policies
 
