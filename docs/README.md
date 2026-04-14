@@ -6,6 +6,7 @@
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Developers / auditors. Module layout, dependency graph, invariants, runtime flow, CS integration, v1.1 roadmap. |
 | [PLUGIN_GUIDE.md](PLUGIN_GUIDE.md) | Plugin authors. Required symbols, optional hooks, what's automatic, worked examples. |
 | [CD_HANDOFF.md](CD_HANDOFF.md) | Any upstream dispatcher (Claude Dispatcher / Claude Developer / orchestrator agent) integrating with Cortex via CS. |
+| [ROADMAP.md](ROADMAP.md) | v1.1 (CS auth + TLS + push channel), v1.2 (plugin isolation via subinterpreters), v1.3 (open slot). What stays stable. |
 
 Threat model and per-round security history live in
 [`../SECURITY.md`](../SECURITY.md). Active invariant exemptions are
