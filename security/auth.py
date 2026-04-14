@@ -257,7 +257,7 @@ def build_require_auth(
     """
     def require_auth(request) -> ClientIdentity:
         # Imported here to avoid making security.* depend on fastapi.
-        from fastapi import HTTPException, Header, Cookie
+        from fastapi import HTTPException
         # Pull the inputs directly off the request so the dependency
         # signature stays uniform — endpoints can't forget a header.
         authorization = request.headers.get("authorization", "")

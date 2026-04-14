@@ -94,23 +94,45 @@ def _targets():
     return _discover_targets()
 
 
+# R16 perf fix (Perplexity): tokenising a source file is O(n); the
+# pre-R16 implementation re-tokenised per line lookup, making any
+# test that asked about N lines O(n²). test_allow_comments_have_
+# lifecycle scans ~thousands of lines — Perplexity's R15 audit
+# reported >60s timeout. Cache the per-file token map so every
+# test sharing the same source string pays the parse cost once.
+_COMMENTS_CACHE: dict[int, dict[int, list[str]]] = {}
+
+
+def _build_comment_map(src: str) -> dict[int, list[str]]:
+    """Tokenise *src* once. Return {lineno: [comment_token_strings]}."""
+    result: dict[int, list[str]] = {}
+    try:
+        for t in tokenize.generate_tokens(io.StringIO(src).readline):
+            if t.type == tokenize.COMMENT:
+                result.setdefault(t.start[0], []).append(t.string)
+    except tokenize.TokenizeError:
+        pass
+    return result
+
+
 def _comment_strings_on_line(src: str, lineno: int) -> list[str]:
     """Return just the comment tokens on *lineno* (1-indexed).
 
-    R14/#2 hardening: previously we ran the allow-regex on the raw
-    source line, which matched if the string literal on that line
-    happened to contain "# invariant: allow-X because Y". An attacker
-    (or a careless refactor) could bypass an invariant by sneaking the
-    magic text into a docstring or string constant. tokenize.generate_
-    tokens distinguishes COMMENT tokens from STRING tokens — we only
-    accept the former.
+    R14/#2 hardening: tokenize.generate_tokens distinguishes COMMENT
+    tokens from STRING tokens — a string literal containing
+    ``# invariant: allow-X because Y`` cannot satisfy the allow check.
+
+    R16 (perf): memoised per source string. id(src) as key works
+    because _targets() returns the same (name, text) tuples inside
+    a single test run; a different test that reads fresh text gets
+    a fresh cache entry naturally.
     """
-    try:
-        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
-    except tokenize.TokenizeError:
-        return []
-    return [t.string for t in toks
-            if t.type == tokenize.COMMENT and t.start[0] == lineno]
+    key = id(src)
+    mapping = _COMMENTS_CACHE.get(key)
+    if mapping is None:
+        mapping = _build_comment_map(src)
+        _COMMENTS_CACHE[key] = mapping
+    return mapping.get(lineno, [])
 
 
 def _allow_comment(line_or_source: str, rule_id: str, lineno: int | None = None,
@@ -463,9 +485,11 @@ def test_allow_comments_have_lifecycle():
     expired: list[str] = []
 
     for fname, src in _targets():
-        for lineno, line in enumerate(src.splitlines(), 1):
-            # Only look at comment tokens, never string literals.
-            comments_on_line = _comment_strings_on_line(src, lineno)
+        # R16: iterate the comment map directly — avoids the
+        # splitlines() × per-line-lookup path even with the cache.
+        comment_map = _build_comment_map(src)
+        _COMMENTS_CACHE[id(src)] = comment_map
+        for lineno, comments_on_line in comment_map.items():
             for comment in comments_on_line:
                 m = _ALLOW_WITH_EXPIRY_RE.search(comment)
                 if m:

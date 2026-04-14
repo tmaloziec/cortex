@@ -587,8 +587,14 @@ def test_compacted_history_uses_nonce_tag():
     assert summary_turn["content"].count(f"</{outer}>") == 1
 
 
-# ─── R9/#1 rate limit on /api/* via _require_auth ────────────────────────
+# ─── R9/#1 + R13/C1 + R16: rate limit on authenticated path ──────────────
 def test_require_auth_rate_limits():
+    """R16 rewrite (Perplexity): the pre-R14 inline `web._require_auth`
+    function was removed when the FastAPI Depends wiring landed.
+    This test now exercises the security-package factory directly:
+    ``build_require_auth`` returns a Depends-compatible callable that
+    authenticates by cookie / header / query and rate-limits failures.
+    Drives the pre-auth failure bucket until 429 trips."""
     import sys as _sys, importlib
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     try:
@@ -596,31 +602,45 @@ def test_require_auth_rate_limits():
     except ImportError:
         print("  SKIP (fastapi not installed)")
         return
-    os.environ["WEB_TOKEN"] = "real-token-r9"
-    if "web" in _sys.modules:
-        del _sys.modules["web"]
-    web = importlib.import_module("web")
+    if "security" in _sys.modules:
+        del _sys.modules["security"]
+        for k in [k for k in _sys.modules if k.startswith("security.")]:
+            del _sys.modules[k]
+    from security import SessionManager, build_require_auth
+    from security.auth import _auth_fail_log, _auth_fail_lock, _AUTH_FAIL_LIMIT
+    from fastapi import HTTPException
 
     class _FakeClient:
         host = "192.0.2.17"  # TEST-NET-1
+    class _FakeQP(dict):
+        def get(self, k, default=None): return default
     class _FakeReq:
         client = _FakeClient()
-        headers = {}
+        headers: dict = {}
+        cookies: dict = {}
+        query_params = _FakeQP()
 
-    # Clear the bucket and drive N failures through _require_auth.
-    with web._auth_fail_lock:
-        web._auth_fail_log.clear()
+    sm = SessionManager()
+    require_auth = build_require_auth(
+        master_token="real-token-r16",
+        sessions=sm,
+        trust_proxy=False,
+    )
+    with _auth_fail_lock:
+        _auth_fail_log.clear()
     req = _FakeReq()
+    # Put a bad token in the headers so the fallback path runs and fails.
+    req.headers = {"x-token": "bad"}
     caught_429 = False
-    for i in range(web._AUTH_FAIL_LIMIT + 2):
+    for i in range(_AUTH_FAIL_LIMIT + 2):
         try:
-            web._require_auth(req, query_token="bad-" + str(i))
-        except web.HTTPException as e:
+            require_auth(req)
+        except HTTPException as e:
             if e.status_code == 429:
                 caught_429 = True
                 break
             assert e.status_code == 401, f"unexpected status {e.status_code}"
-    assert caught_429, "rate limit never triggered via _require_auth"
+    assert caught_429, "rate limit never triggered via build_require_auth"
 
 
 # ─── R9/#2 IPv6 /64 bucketing ────────────────────────────────────────────
