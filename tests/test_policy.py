@@ -917,6 +917,85 @@ def test_rate_limit_key_strips_ipv6_zone():
         )
 
 
+# ─── R17 sentinel capability enforcement ─────────────────────────────────
+def test_fallback_sentinel_cannot_be_forged():
+    """R17 (red team round 8 + Claude R15 audit): verify every
+    sentinel-forgery path is refused. The sentinel is capability-based
+    (witness token + WeakSet registry), not type-membership (isinstance).
+
+    Each test below corresponds to a documented bypass attempt:
+      - direct public constructor (Claude kill shot)
+      - subclass (red team G1)
+      - __new__ without __init__ (red team G2)
+      - copy.copy mutation (red team G3)
+      - direct lambda / callable (R15 baseline)
+    """
+    import sys as _sys, copy as _copy
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    try:
+        import fastapi  # noqa: F401
+    except ImportError:
+        print("  SKIP (fastapi not installed)")
+        return
+    if "recovery" in _sys.modules:
+        del _sys.modules["recovery"]
+    from recovery import RecoveryEngine
+    from security import FallbackPolicy
+    from security.fallback import _FallbackSentinel, _is_registered_sentinel
+
+    os.environ["CORTEX_FALLBACK_ANTHROPIC"] = "1"
+    pol = FallbackPolicy.from_env(anthropic_key="t", call_fn=lambda *a,**k: {})
+    real = pol.as_recovery_callable()
+    assert real is not None
+    assert _is_registered_sentinel(real), "legitimate sentinel not in registry"
+
+    # 1. Direct public constructor refused.
+    try:
+        _FallbackSentinel(lambda m: {})
+        raise AssertionError("direct constructor should be refused")
+    except TypeError:
+        pass
+
+    # 2. Subclass refused at definition time.
+    try:
+        class _Fake(_FallbackSentinel):
+            pass
+        raise AssertionError("subclass should be refused")
+    except TypeError:
+        pass
+
+    # 3. __new__ bypass: instance creatable, but not in registry.
+    obj = _FallbackSentinel.__new__(_FallbackSentinel)
+    assert not _is_registered_sentinel(obj), "__new__ instance leaked into registry"
+    try:
+        RecoveryEngine(fallback_fn=obj, compact_fn=None)
+        raise AssertionError("__new__ instance should be refused by RecoveryEngine")
+    except TypeError:
+        pass
+
+    # 4. copy.copy refused at clone time (__setattr__ guard).
+    try:
+        _copy.copy(real)
+        raise AssertionError("copy.copy should be refused")
+    except (AttributeError, TypeError):
+        pass
+
+    # 5. Direct lambda refused.
+    try:
+        RecoveryEngine(fallback_fn=lambda m: {}, compact_fn=None)
+        raise AssertionError("bare lambda should be refused")
+    except TypeError:
+        pass
+
+    # 6. Legitimate sentinel accepted (regression-check).
+    r = RecoveryEngine(fallback_fn=real, compact_fn=None)
+    assert r.fallback_fn is real
+
+    # 7. None still accepted (fallback disabled).
+    r = RecoveryEngine(fallback_fn=None, compact_fn=None)
+    assert r.fallback_fn is None
+
+
 # ─── Positive cases (regression: we didn't over-block) ───────────────────
 def test_legitimate_paths_still_allowed():
     p = PolicyEngine()

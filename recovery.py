@@ -12,6 +12,14 @@ import requests
 from typing import Optional, Callable
 
 from security import make_system_note, make_user_note
+# R17: top-level import, not late-import inside __init__.
+# Red-team round 8 G5 showed that late-importing the sentinel check
+# inside RecoveryEngine.__init__ opened an ordering attack: a plugin's
+# on_activate could monkey-patch sys.modules["security"] between agent
+# startup and RecoveryEngine construction, substituting a
+# metaclass-spoofed type. Resolving the name at module-import time
+# freezes the binding before any plugin runs.
+from security.fallback import _is_registered_sentinel as _sentinel_ok
 
 log = logging.getLogger("recovery")
 
@@ -66,24 +74,25 @@ class RecoveryEngine:
         compact_fn:  funkcja do kompresji kontekstu
         alert_fn:    funkcja do alertowania (np. CS note)
         """
-        # R15: runtime structural check. Red team round 7 demonstrated
-        # that AST walker for invariant #4 had an infinite family of
-        # syntactic bypasses (lambda, partial, **kwargs splat, factory
-        # functions, BoolOp, Subscript, match-case...). We stop playing
-        # AST whack-a-mole: the ONLY legitimate fallback_fn is one
-        # produced by FallbackPolicy.as_recovery_callable(), which wraps
-        # in a _FallbackSentinel. Anything else is rejected at
-        # construction time, no matter what the AST shape was.
-        if fallback_fn is not None:
-            from security import _FallbackSentinel as _FS
-            if not isinstance(fallback_fn, _FS):
-                raise TypeError(
-                    "RecoveryEngine.fallback_fn must come from "
-                    "FallbackPolicy.from_env(...).as_recovery_callable(). "
-                    "Bare call_anthropic / lambda / partial wiring is refused "
-                    "at runtime so silent Anthropic upload on Ollama blip "
-                    "can't be enabled by mistake. See security/fallback.py."
-                )
+        # R17: capability check by identity, not type.
+        # R15 used isinstance(), which red-team round 8 and Claude's
+        # R15 audit both broke with a one-liner (subclass / __new__ /
+        # copy / metaclass __instancecheck__ / direct construction).
+        # _is_registered_sentinel checks WeakSet membership — forged
+        # objects aren't registered even if their class would pass
+        # isinstance, and the only code path that registers them is
+        # FallbackPolicy.as_recovery_callable.
+        if fallback_fn is not None and not _sentinel_ok(fallback_fn):
+            raise TypeError(
+                "RecoveryEngine.fallback_fn must come from "
+                "FallbackPolicy.from_env(...).as_recovery_callable(). "
+                "Bare call_anthropic / lambda / partial wiring is refused "
+                "at runtime so silent Anthropic upload on Ollama blip "
+                "can't be enabled by mistake. Forged sentinels "
+                "(subclass, __new__, copy.copy, direct constructor) are "
+                "also refused — the check is capability-by-identity, "
+                "not type-membership. See security/fallback.py."
+            )
         self.fallback_fn = fallback_fn
         self.compact_fn = compact_fn
         self.alert_fn = alert_fn

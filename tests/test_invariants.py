@@ -476,7 +476,9 @@ def test_allow_comments_have_lifecycle():
     for the magic comment.
     """
     import datetime as _dt
-    today = _dt.date.today()
+    # R17/L-1: use UTC so expiry is unambiguous across contributor time
+    # zones (local date.today() could be off-by-one near midnight).
+    today = _dt.datetime.now(_dt.timezone.utc).date()
     grace_end = _dt.date.fromisoformat(_GRACE_END_DATE)
 
     offenders: list[str] = []
@@ -491,24 +493,60 @@ def test_allow_comments_have_lifecycle():
         _COMMENTS_CACHE[id(src)] = comment_map
         for lineno, comments_on_line in comment_map.items():
             for comment in comments_on_line:
-                m = _ALLOW_WITH_EXPIRY_RE.search(comment)
-                if m:
-                    expiry = _dt.date.fromisoformat(m.group("date"))
+                # R17/M-2 (Claude): use findall instead of search so two
+                # allow-comments concatenated on one physical comment
+                # are both tracked.
+                for m in _ALLOW_WITH_EXPIRY_RE.finditer(comment):
+                    date_str = m.group("date")
+                    try:
+                        expiry = _dt.date.fromisoformat(date_str)
+                    except ValueError:
+                        # R17/M-3: don't crash the whole test on a
+                        # malformed date (e.g. 2026-13-45) — flag the
+                        # line as an offender with a clear reason.
+                        offenders.append(
+                            f"{fname}:{lineno} malformed until= date "
+                            f"{date_str!r} on rule={m.group('rule')}"
+                        )
+                        continue
+                    # R17/L-2: clamp an overly-distant expiry so
+                    # `until=9999-12-31 because forever` can't silently
+                    # become a permanent backdoor. 180 days is long
+                    # enough for any legitimate migration.
+                    max_horizon = today + _dt.timedelta(days=180)
+                    if expiry > max_horizon:
+                        offenders.append(
+                            f"{fname}:{lineno} until={date_str} is more than "
+                            f"180 days out on rule={m.group('rule')} — pick a "
+                            f"shorter horizon or split the migration"
+                        )
+                        continue
+                    # R17: markdown-escape the reason before it flows
+                    # into UNSAFE.md to stop a reviewer-spoofing
+                    # reason string like ``<details>...<summary>``.
+                    reason_escaped = (m.group("reason")[:80]
+                                      .replace("<", "&lt;")
+                                      .replace(">", "&gt;")
+                                      .replace("`", "\\`"))
                     entry = (f"{fname}:{lineno} rule={m.group('rule')} "
-                             f"until={m.group('date')} because={m.group('reason')[:80]}")
+                             f"until={date_str} because={reason_escaped}")
                     if expiry < today:
                         expired.append(entry)
                     else:
                         with_expiry.append(entry)
+                # Skip the legacy regex if we already found an expiry
+                # form on this comment (avoid double-counting).
+                if _ALLOW_WITH_EXPIRY_RE.search(comment):
                     continue
-                # Legacy shape with no until=
-                m2 = _ALLOW_LEGACY_RE.search(comment)
-                if m2:
+                # Legacy shape with no until=. findall, not search.
+                for m2 in _ALLOW_LEGACY_RE.finditer(comment):
+                    reason_escaped = (m2.group("reason")[:80]
+                                      .replace("<", "&lt;")
+                                      .replace(">", "&gt;")
+                                      .replace("`", "\\`"))
                     entry = (f"{fname}:{lineno} rule={m2.group('rule')} "
-                             f"(no until=) because={m2.group('reason')[:80]}")
+                             f"(no until=) because={reason_escaped}")
                     if today > grace_end:
-                        # Past the grace period — every allow comment
-                        # must now carry a lifecycle date.
                         offenders.append(entry)
                     else:
                         grandfathered.append(entry)

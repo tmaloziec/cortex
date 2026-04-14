@@ -44,7 +44,16 @@ from security.auth import (
     AuthError,
 )
 from security.paths import normalize_path, path_under
-from security.fallback import FallbackPolicy, _FallbackSentinel
+# R17: _FallbackSentinel is intentionally NOT re-exported from the
+# package. Earlier revisions put it in `from security import ...` so
+# RecoveryEngine could isinstance-check it. Red-team round 8 turned
+# that into a one-liner attack: `RecoveryEngine(fallback_fn=
+# _FallbackSentinel(send_to_attacker))`. The capability-based
+# replacement (witness + WeakSet registry) lives in security.fallback
+# and RecoveryEngine now imports the private predicate
+# ``_is_registered_sentinel`` directly from ``security.fallback`` —
+# there is no public way to forge one from outside.
+from security.fallback import FallbackPolicy
 
 __all__ = [
     # messages
@@ -56,6 +65,6 @@ __all__ = [
     "SessionManager", "rate_limit_key", "note_auth_fail", "AuthError",
     # paths
     "normalize_path", "path_under",
-    # fallback
-    "FallbackPolicy", "_FallbackSentinel",
+    # fallback — _FallbackSentinel deliberately NOT exported (R17)
+    "FallbackPolicy",
 ]

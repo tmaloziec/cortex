@@ -94,18 +94,30 @@ def wrap_untrusted(kind: str, content: Any, **attrs: Any) -> str:
     return f'<{tag} untrusted="true"{attr_s}>\n{safe}\n</{tag}>'
 
 
-# R15/E4 (red team round 7): capture security primitives as function
-# defaults so a plugin that monkey-patches ``security.messages.wrap_
-# untrusted`` at runtime (via its own on_activate hook) cannot weaken
-# the wrappers that were already defined. Each helper below binds its
-# security dependencies as default args at def time. Reassigning
-# ``security.messages.wrap_untrusted`` after the fact won't affect the
-# captured local reference.
+# R15/E4 (red team round 7), honest scoping after R17 review:
+# ------------------------------------------------------------
+# These helpers bind their security dependencies as default args so
+# the simple attribute-level monkey-patch
+#     security.messages.wrap_untrusted = weaker_version
+# from a plugin's on_activate does not affect already-defined
+# helpers — the default-arg captured at def-time still points at
+# the original. This closes the common accidental-regression path
+# from a careless plugin author.
 #
-# Plugins remain trusted-by-design, but "trusted" shouldn't mean
-# "capable of silently disabling security invariants for the rest of
-# the process". This closes that sharp edge without requiring a
-# sandbox.
+# This is an *ergonomic* defence, NOT a security boundary:
+#
+#   * ``wrap_tool_output.__defaults__`` is itself a mutable tuple.
+#     ``wrap_tool_output.__defaults__ = (evil,)`` reassigns it.
+#   * A plugin running in the same process has full introspection
+#     access (``dict.__setattr__``, ``ctypes.pythonapi.PyCell_Set``
+#     for closures, etc.).
+#
+# Real isolation requires OS-level (container / VM) or interpreter-
+# level (PEP 684 subinterpreters) separation between plugin and agent.
+# Neither is in scope for v1.0.x; plugins are "trusted by design"
+# (see SECURITY.md threat model). The default-arg freeze catches
+# *careless* monkey-patching; it does not — and cannot — withstand
+# a *hostile* in-process plugin.
 
 def wrap_tool_output(name: str, result: str,
                      _wrap=wrap_untrusted) -> str:

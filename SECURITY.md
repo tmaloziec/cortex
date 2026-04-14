@@ -1115,6 +1115,111 @@ Runtime sentinel verified against direct callable, lambda wrap,
 and `functools.partial` bypass attempts — all rejected at
 `RecoveryEngine.__init__` with a pointing error message.
 
+### v1.0.8-rc4 → rc5: R17 capability-based sentinel (isinstance→identity)
+
+Red-team round 8 and Claude's rc3 audit independently found the
+same fundamental in the R15 runtime sentinel: `isinstance` is a
+type-membership check, not a capability check. Python has at least
+five paths that satisfy type-membership without going through the
+issuing code:
+
+1. **Direct public constructor.** `_FallbackSentinel(evil_fn)` —
+   one-liner, isinstance passes.
+2. **Subclass.** `class Fake(_FS): pass; Fake()` — isinstance
+   accepts subclasses.
+3. **`__new__` bypass.** `_FS.__new__(_FS); obj._fn = evil` —
+   skips `__init__` entirely.
+4. **`copy.copy` + mutate.** `fake = copy.copy(real); fake._fn =
+   evil` — preserves class identity.
+5. **Metaclass override.** `class M(type): __instancecheck__ = ...`
+   — returns True for anything.
+
+R15 was "structural" only in the sense of "code structure can't
+accidentally forget it". R17 is structural in the security sense:
+forgery requires breaking Python object identity, not merely its
+type system.
+
+**Four changes make forgery a type error, not a runtime accident:**
+
+- **Witness-token constructor.** `_WITNESS = object()` is a
+  module-local sentinel. `_FallbackSentinel.__init__` refuses
+  any call whose `_witness=` kwarg is not `is`-identical to
+  `_WITNESS`. Only one call site in `FallbackPolicy.as_recovery_
+  callable` holds the reference; nothing else can construct one
+  even after importing the class directly.
+- **Sealed class.** `__init_subclass__` raises `TypeError` at
+  class-definition time — subclass forgery is a syntax-like
+  error, not a runtime check.
+- **`__slots__` + immutable `__setattr__`.** The instance's `_fn`
+  attribute is assigned once in `__init__` and any further
+  assignment raises `AttributeError`. This also defeats
+  `copy.copy`, which crashes during its `setattr` reconstruction
+  step.
+- **WeakSet registry.** `_REGISTRY` holds a weak reference to
+  every legitimately-issued sentinel; `RecoveryEngine` checks
+  `fn in _REGISTRY` (identity membership), not `isinstance`.
+  Forged instances aren't in the set even if their class would
+  pass isinstance; `__new__`-created instances aren't either.
+
+**`_FallbackSentinel` removed from the public API.** It's no
+longer re-exported via `security/__init__.py` or `__all__`;
+`from security import _FallbackSentinel` raises `ImportError`.
+`RecoveryEngine` imports the module-private predicate
+`_is_registered_sentinel` directly from `security.fallback`.
+
+**Top-level import in `recovery.py`.** The R15 late-import inside
+`__init__` was the red-team G5 ordering attack: a plugin's
+`on_activate` could monkey-patch `sys.modules["security"]`
+between agent startup and `RecoveryEngine` construction,
+substituting a metaclass-spoofed type. Resolving the name at
+module-import time freezes the binding before any plugin runs.
+
+**Honest scoping of default-arg freeze.** R15 documented the
+`_wrap=wrap_untrusted` default-arg pattern as a security boundary
+against plugin monkey-patch. Red-team G4 pointed out that
+`function.__defaults__` is itself mutable — `wrap_tool_output.
+__defaults__ = (weaker,)` is a one-liner. R17's comment block
+now says explicitly: default-arg freeze is an *ergonomic*
+defence against careless monkey-patch, not a security boundary.
+Real isolation requires container / VM / subinterpreter
+separation.
+
+**Minor fixes from the same audits:**
+
+- R17/M-2 (Claude): lifecycle parser uses `findall`/`finditer`
+  instead of `search`, so two allow-comments concatenated on one
+  physical comment line are both tracked.
+- R17/M-3: malformed `until=` date is surfaced as an offender
+  entry with a clear message, not an uncaught `ValueError` that
+  aborts the whole test.
+- R17/L-1: lifecycle "today" is now `datetime.now(timezone.utc)
+  .date()` — unambiguous across contributor time zones.
+- R17/L-2: `until=` more than 180 days out is refused — stops
+  `until=9999-12-31 because forever` from becoming a permanent
+  backdoor.
+- R17: `UNSAFE.md` reason strings are HTML-escaped (`<`, `>`,
+  backtick) before embedding, stopping a `<details>`/markdown
+  injection from a crafted `because` field that a reviewer might
+  scroll past.
+
+**Documented as accepted, not fixed (plugin-trust boundary):**
+
+- Direct `object.__setattr__(obj, "_fn", evil)` can still write
+  to a `__new__`-created instance (Python has no true read-only
+  attributes without metaclass gymnastics). The instance is
+  still not in `_REGISTRY`, so `RecoveryEngine` refuses it.
+- A hostile plugin running in the same process has
+  `ctypes.pythonapi.PyCell_Set` available to mutate closure
+  cells, `sys.modules` replacement, and every other in-process
+  introspection primitive. The Cortex threat model has always
+  documented plugins as trusted-by-design — real sandboxing
+  would require OS-level isolation or PEP 684 subinterpreters,
+  neither in scope for v1.0.x.
+
+Tests: 5 invariants + 52 policy = 57 green, STRICT.
+`test_fallback_sentinel_cannot_be_forged` verifies each of the
+five documented bypass attempts is refused.
+
 ### § DoS acceptance
 
 Cortex is a single-user local agent. Classic DoS surface (connection
