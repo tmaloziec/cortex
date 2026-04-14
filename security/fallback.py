@@ -76,66 +76,82 @@ import weakref as _weakref
 # The class is not exported from ``security/__init__.py`` — the
 # underscore prefix was previously advisory; now the only public
 # surface is ``FallbackPolicy``.
-_WITNESS = object()
-_REGISTRY: "_weakref.WeakSet[object]" = _weakref.WeakSet()
+# R18 (GPT rc5 review): both the witness token and the registry are
+# now hidden inside a closure. The previous revision kept ``_WITNESS``
+# and ``_REGISTRY`` as module-level names — even with underscore
+# prefixes they were importable (``from security.fallback import
+# _REGISTRY; _REGISTRY.add(evil)``) which GPT explicitly called out
+# as a "GAME OVER" path. Wrapping them in a closure means the only
+# code that can touch either is the class body + the two public
+# functions the closure returns. Nothing in ``sys.modules`` holds a
+# reference to the registry itself.
 
+def _make_sentinel_machinery():
+    """Build the sentinel class, its witness token, and its registry
+    inside a closure. Returns the class + an identity predicate.
 
-class _FallbackSentinel:
-    """Capability token proving a callable came from
-    ``FallbackPolicy.as_recovery_callable()``.
-
-    Do not construct from outside this module — the witness object
-    required by ``__init__`` is not exported. ``RecoveryEngine``
-    checks registry membership by identity; forged subclasses,
-    ``__new__``-skipped instances, and ``copy.copy`` clones are
-    NOT in the registry and are refused.
+    The witness and the registry are closure cells — no module-level
+    name, no ``sys.modules`` attribute, no ``from … import`` path
+    reaches them. The only way to satisfy the predicate is to obtain
+    an instance produced by the single registering call site.
     """
+    witness = object()
+    registry: "_weakref.WeakSet[object]" = _weakref.WeakSet()
 
-    __slots__ = ("_fn", "__weakref__")
+    class _FallbackSentinel:
+        """Capability token proving a callable came from
+        ``FallbackPolicy.as_recovery_callable()``.
 
-    def __init_subclass__(cls, **kwargs):
-        raise TypeError(
-            "_FallbackSentinel is sealed; only FallbackPolicy may produce it"
-        )
+        Do not construct from outside this module — the witness
+        object required by ``__init__`` is captured in a closure
+        and not exported. ``RecoveryEngine`` checks registry
+        membership by identity; forged subclasses, ``__new__``-
+        skipped instances, and ``copy.copy`` clones are NOT in
+        the registry and are refused.
+        """
 
-    def __init__(self, fn: Callable, _witness: object | None = None):
-        if _witness is not _WITNESS:
+        __slots__ = ("_fn", "__weakref__")
+
+        def __init_subclass__(cls, **kwargs):
             raise TypeError(
-                "_FallbackSentinel is not publicly constructible; "
-                "go through FallbackPolicy.from_env(...).as_recovery_callable()"
+                "_FallbackSentinel is sealed; only FallbackPolicy may produce it"
             )
-        # __slots__ + our __setattr__ means this is the ONLY assignment
-        # to _fn ever permitted on this instance.
-        object.__setattr__(self, "_fn", fn)
-        _REGISTRY.add(self)
 
-    def __setattr__(self, name, value):
-        # Block post-construction mutation. An attacker with
-        # ``copy.copy(real)`` skips __init__ and is not in _REGISTRY,
-        # but this also stops the simpler ``sentinel._fn = evil``.
-        raise AttributeError(
-            f"_FallbackSentinel is immutable; cannot set {name!r}"
-        )
+        def __init__(self, fn, _witness=None):
+            if _witness is not witness:
+                raise TypeError(
+                    "_FallbackSentinel is not publicly constructible; "
+                    "go through FallbackPolicy.from_env(...).as_recovery_callable()"
+                )
+            object.__setattr__(self, "_fn", fn)
+            registry.add(self)
 
-    def __call__(self, messages, *args, **kwargs):
-        # Belt-and-braces: even a correctly-registered sentinel
-        # refuses to fire if its identity isn't in the registry at
-        # call time (catches theoretical future tampering).
-        if self not in _REGISTRY:
-            raise RuntimeError("_FallbackSentinel tampered — refusing to call")
-        return self._fn(messages, *args, **kwargs)
+        def __setattr__(self, name, value):
+            raise AttributeError(
+                f"_FallbackSentinel is immutable; cannot set {name!r}"
+            )
+
+        def __call__(self, messages, *args, **kwargs):
+            if self not in registry:
+                raise RuntimeError("_FallbackSentinel tampered — refusing to call")
+            return self._fn(messages, *args, **kwargs)
+
+        # The witness is captured in the closure; a classmethod
+        # ``_make`` is the only externally-visible construction
+        # entry point and it remains module-private.
+        @classmethod
+        def _make(cls, fn):
+            return cls(fn, _witness=witness)
+
+    def _is_registered(obj):
+        return obj in registry
+
+    return _FallbackSentinel, _is_registered
 
 
-def _is_registered_sentinel(obj: object) -> bool:
-    """Module-level predicate for ``RecoveryEngine`` to use.
-
-    Using membership in the WeakSet (``obj in _REGISTRY``) checks
-    by object identity — subclasses, ``__new__``-skipped instances,
-    and ``copy.copy`` clones are not in the set even if ``isinstance``
-    would accept them. This is the capability check R17 replaced
-    the R15 ``isinstance`` shortcut with.
-    """
-    return obj in _REGISTRY
+_FallbackSentinel, _is_registered_sentinel = _make_sentinel_machinery()
+# `_WITNESS` / `_REGISTRY` deliberately no longer exist at module
+# level; re-exposing them would undo the whole closure move.
 
 
 class FallbackPolicy:
@@ -202,6 +218,8 @@ class FallbackPolicy:
             )
             return call_fn(payload, *a, **kw)
 
-        # Only this call site holds a reference to _WITNESS, so this
-        # is the only way to obtain a token registered in _REGISTRY.
-        return _FallbackSentinel(_logged_fallback, _witness=_WITNESS)
+        # R18: witness is captured in closure (see
+        # _make_sentinel_machinery above). The _make classmethod is the
+        # only entry point that supplies it — there is no module-level
+        # constant anyone else could import.
+        return _FallbackSentinel._make(_logged_fallback)

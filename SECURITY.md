@@ -29,6 +29,43 @@ running the web UI on a public network without auth — Cortex is **not**
 designed to be safe, and we do not try to make it so. Those scenarios need a
 different tool.
 
+### What the security invariants DO and DO NOT protect against
+
+GPT's rc5 architectural review flagged that we had been documenting
+"careless plugin" and "malicious plugin" with the same language. They
+are different classes. This section draws the line explicitly.
+
+| Class                           | Example                                                                | Protected? |
+| :------------------------------ | :--------------------------------------------------------------------- | :--------- |
+| External network / untrusted UI | HTTP attacker, CSRF, XSS, WS replay                                    | **Yes**    |
+| Malicious file contents         | prompt-injected README the agent reads                                 | **Yes**    |
+| Compromised CS server           | SSRF'd briefing attempts to plant rules                                | **Yes**    |
+| **Careless plugin author**      | well-meaning plugin accidentally constructs a bare dict / bypasses wrap | **Yes**    |
+| **Hostile in-process plugin**   | `ctypes.pythonapi.PyCell_Set`, `sys.modules` replacement, etc.         | **No**     |
+| OS-level compromise             | root on the machine, kernel bug                                         | **No**     |
+
+The R17 capability-based sentinel (witness token + WeakSet registry
+closed over by `security/fallback.py`'s `_make_sentinel_machinery`)
+closes the common accidental bypass path — a plugin that names
+`_FallbackSentinel` directly in its code now fails at import time.
+
+It does **not** close the ctypes / sys.modules-replacement path. A
+hostile plugin running in the same interpreter as the agent has full
+introspection access and cannot be constrained by any in-process
+Python mechanism. Real isolation from a hostile plugin requires one
+of:
+
+- OS-level separation (subprocess + seccomp-bpf, container, VM).
+- PEP 684 subinterpreters (Python 3.12+) with plugin-in-subinterp
+  loading. Tracked for v1.2.
+
+**Cortex's threat model is explicit: plugins are trusted-by-design.**
+The invariants protect against *accidental* regressions from that
+trust, not *intentional* subversion. Commercial licensees distributing
+plugin ecosystems to end-users MUST put the plugin on the other side
+of a process or interpreter boundary; this package will not do it for
+you.
+
 ## Intentional design decisions (not bugs)
 
 Static analyzers and external reviewers often flag the items below. They are
@@ -1219,6 +1256,53 @@ separation.
 Tests: 5 invariants + 52 policy = 57 green, STRICT.
 `test_fallback_sentinel_cannot_be_forged` verifies each of the
 five documented bypass attempts is refused.
+
+### v1.0.8 stable — R18: registry closure + CI workflow + threat model clarity
+
+GPT rc5 architectural review identified three items separating
+rc5 from commercial-ready stable. All three addressed here.
+
+**`_REGISTRY` and `_WITNESS` moved into a closure.** The rc5
+revision kept both as module-level names. GPT explicitly called
+out that underscore is advisory, not access control — `from
+security.fallback import _REGISTRY; _REGISTRY.add(evil)` would
+have been a one-liner forgery. `_make_sentinel_machinery()` now
+builds the class, witness, and registry inside a factory and
+returns only (`_FallbackSentinel`, `_is_registered_sentinel`).
+Neither the witness object nor the registry appears in
+`dir(security.fallback)` nor is reachable via import. The only
+code path that registers a sentinel is the closure-captured
+`_make` classmethod; the only code path that queries membership
+is the returned predicate.
+
+**GitHub Actions workflow shipped.** `.github/workflows/
+invariants.yml` runs the five invariant tests (STRICT), the 52
+policy regression tests, verifies `UNSAFE.md` is up to date
+(`git diff --exit-code`), and runs `pip-audit -r requirements.txt
+--strict` on every push and PR. Commercial licensees can require
+this as a branch-protection check in their fork. Python version
+pinned to 3.12 so AST node shape differences across minor
+versions don't silently weaken the walker.
+
+**Threat-model boundary drawn explicitly.** SECURITY.md now has
+a `Class | Protected?` table separating external attackers,
+malicious file contents, careless plugin authors (all protected),
+from hostile in-process plugins and OS-level compromise (both
+NOT protected, by design). The phrase "plugins are trusted by
+design" was previously scattered across several sections; GPT
+noted that it blurred "careless" and "hostile" as if they were
+the same class. They aren't — R17 closes careless, real
+isolation from hostile requires OS separation or PEP 684
+subinterpreters (v1.2 tracking).
+
+The five R17 bypass paths (direct constructor, subclass,
+`__new__`, `copy.copy`, metaclass `__instancecheck__`) all remain
+refused under the closure-ised machinery:
+`test_fallback_sentinel_cannot_be_forged` still passes.
+
+Tests: 5 invariants + 52 policy = 57 green, STRICT, verified on
+Python 3.12 against every documented forgery path. CI now enforces
+all of this on every PR.
 
 ### § DoS acceptance
 
