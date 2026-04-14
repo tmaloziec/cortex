@@ -232,6 +232,24 @@ Cortex is **dual-licensed**:
 
 See [LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md) for when you need a commercial license and how to obtain one.
 
+## Documentation
+
+Full documentation set lives in [`docs/`](docs/):
+
+- [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) — installation,
+  running modes, environment variables, troubleshooting.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — module layout,
+  dependency graph, security invariants, runtime data flow, CS
+  integration, v1.1/v1.2 roadmap.
+- [`docs/PLUGIN_GUIDE.md`](docs/PLUGIN_GUIDE.md) — plugin
+  authoring reference with worked examples.
+- [`docs/CD_HANDOFF.md`](docs/CD_HANDOFF.md) — integration notes
+  for upstream dispatcher agents (Claude Dispatcher / Claude
+  Developer / orchestrators) routing tasks via CS.
+
+Threat model: [`SECURITY.md`](SECURITY.md). Active invariant
+exemptions: [`UNSAFE.md`](UNSAFE.md) (auto-generated).
+
 ## Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
