@@ -1,0 +1,10 @@
+# .mailmap — display mapping for historical commits.
+#
+# Format: <canonical name> <canonical email> <old name> <old email>
+#
+# git tools (log, blame, shortlog) and GitHub honor this file to display
+# historic commits under the maintainer's canonical identity without
+# rewriting git history. SHAs stay stable, tags stay valid, forks stay
+# in sync.
+
+Tomasz Małozięć <225959895+tmaloziec@users.noreply.github.com> Tomek <tomek@build-on-ai.dev>
