@@ -1,0 +1,39 @@
+# Cortex CODEOWNERS — security-invariant protection.
+#
+# GitHub / Gitea / Gerrit read this file and require the listed
+# reviewer(s) to approve any PR that touches the matching paths.
+# The point is not "one maintainer bottlenecks all work" — the point
+# is that relaxing a security invariant should never happen silently.
+#
+# Whoever is the acting maintainer at the time the repo is deployed
+# commercially should replace @tmaloziec with their handle + any
+# co-owners. Before then this file mostly documents intent.
+
+# Default: any change in the repo needs a maintainer look.
+*           @tmaloziec
+
+# The security invariants themselves. Relaxing a rule, adding a new
+# KIND, changing the untrusted-container contract, widening an
+# allow-list — all must go through a reviewer who understands why
+# the invariant exists.
+/security/                  @tmaloziec
+/tests/test_invariants.py   @tmaloziec
+/tests/test_policy.py       @tmaloziec
+/policy.py                  @tmaloziec
+/SECURITY.md                @tmaloziec
+
+# R14/#5: protect CI configuration + the CODEOWNERS file itself.
+# Otherwise a PR could disable the guards or drop the ownership rule
+# in the same diff.
+/.github/                   @tmaloziec
+/CODEOWNERS                 @tmaloziec
+/run.sh                     @tmaloziec
+# conftest.py listed if/when it's added.
+
+# Dependency pins (CVE-relevant).
+/requirements.txt           @tmaloziec
+
+# Commercial licensing surface — change intent, not code style.
+/LICENSE                    @tmaloziec
+/LICENSE-COMMERCIAL.md      @tmaloziec
+/CLA.md                     @tmaloziec

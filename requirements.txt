@@ -1,0 +1,37 @@
+# Cortex — dependencies (pinned for reproducible installs and CVE tracking)
+#
+# Refresh policy: run `pip-audit -r requirements.txt` and bump pins quarterly,
+# or sooner when a CVE is disclosed. Keep minor/patch upgrades within a
+# single PR and run `python ws_test.py` against a live instance first.
+# R12/DEP (corrects R11): fastapi 0.115.12 pins starlette<0.47.0, which
+# transitively kept starlette==0.46.2 — STILL vulnerable to CVE-2025-62727
+# (HIGH, Range-header O(n²) DoS) and CVE-2025-54121 (MED, multipart
+# event-loop block). Perplexity CVE audit on v1.0.7.7 caught the
+# discrepancy: the R11 comment claimed both CVEs closed, but pip-audit
+# still reported them OPEN.
+#
+# Fix: explicit starlette pin at ≥0.49.1 AND bump fastapi to a minor
+# that accepts it (0.116.x and later widen the starlette range). Pin
+# starlette as the load-bearing line so the CVE fix is expressed
+# directly, not implied through a chain.
+#   - starlette CVE-2025-62727 (Range header O(n²) DoS — HIGH) — closed
+#   - starlette CVE-2025-54121 (multipart event-loop block — MED) — closed
+#   - requests CVE-2024-47081 (.netrc leak on crafted URLs — LOW) — closed
+#   - requests CVE-2026-25645 (predictable temp file — LOW, not exercised) — closed
+#
+# Verify after any bump:  pip-audit -r requirements.txt
+requests==2.33.1
+# R14 correction: R13 pinned fastapi>=0.116.0,<0.120.0 assuming fastapi
+# would accept starlette 0.49.1 — it does not (fastapi 0.116-0.119 all
+# require starlette<0.49.0). Perplexity pip-audit caught: the combo was
+# unresolvable, pip refused to install the pinned set at all.
+#
+# fastapi 0.120.4 widens its starlette range to <0.50.0, so starlette
+# 0.49.1 (with the CVE fixes) is now installable. Verify after any bump:
+#   pip-audit -r requirements.txt
+fastapi>=0.120.4,<0.136.0
+starlette==0.49.1
+uvicorn==0.34.2
+websockets==15.0.1
+# Optional extras — uncomment or install via `pip install -r requirements-extras.txt`
+# anthropic==0.40.0    # Anthropic Claude API fallback (set ANTHROPIC_API_KEY)

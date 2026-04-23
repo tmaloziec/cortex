@@ -1,0 +1,61 @@
+name: cs contract
+
+# Verifies that every CS endpoint cortex calls still exists in the
+# published consciousness-server. Catches the class of bug where one
+# repo refactors a route and the other silently 404s until a user hits
+# it. The nightly cron covers CS-side changes that never touch cortex.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+
+concurrency:
+  group: cs-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Clone published consciousness-server
+        run: git clone --depth=1 https://github.com/build-on-ai/consciousness-server.git /tmp/cs
+
+      - name: Start CS stack (AUTH_MODE=off)
+        working-directory: /tmp/cs/deploy
+        run: docker compose up -d
+
+      - name: Wait for CS /health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:3032/health > /dev/null; then
+              echo "CS healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::CS did not become healthy in 60s"
+          docker compose -f /tmp/cs/deploy/docker-compose.yml logs
+          exit 1
+
+      - name: Run cortex↔CS contract test
+        env:
+          CS_URL: http://127.0.0.1:3032
+        run: python3 tests/test_cs_contract.py
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f /tmp/cs/deploy/docker-compose.yml down -v
